@@ -25,16 +25,16 @@ module Ast = struct
 
   let strings = ref Strings.empty
 
-  let string x = 
+  let string x =
     try Strings.find x !strings
     with Not_found -> strings := Strings.add x !strings; x
 
   let atom x = Atom (string x)
   let var x = Var (string x)
 
-  let pred ?(infix=false) name args = Pred {name = string name;infix;args}
+  let pred ?(infix=false) name args = Pred { name = string name;infix;args }
   let clause x y = Clause (x,y)
-    
+
   module VarMap = Map.Make(struct type t = string let compare = compare end)
 
   module PP = struct
@@ -50,10 +50,11 @@ module Ast = struct
     let atom ppf = pp_print_string ppf
     let var ppf  = pp_print_string ppf
 
-    let rec pred ppf {name; infix; args} = 
-      if infix
-      then fprintf ppf "%a"  (list name term) args
-      else fprintf ppf "%s(%a)" name (list "," term) args
+    let rec pred ppf { name; infix; args } =
+      match infix, args with
+      |    _, [] -> fprintf ppf "%s" name
+      | true,  _ -> fprintf ppf "%a"  (list name term) args
+      | _        -> fprintf ppf "%s(%a)" name (list "," term) args
     and term ppf = function
       | Atom a -> atom ppf a
       | Var v  -> var ppf v
@@ -67,7 +68,7 @@ module Ast = struct
     | Var v  -> VarMap.add v v l
     | Pred p -> pred_vars l p
     | Clause (p,t) -> clause_vars l (p,t)
-  and clause_vars l (p,t) = 
+  and clause_vars l (p,t) =
     term_vars (pred_vars l p) t
   and pred_vars l p =
     List.fold_left term_vars l p.args
@@ -83,28 +84,36 @@ end (* Ast *)
 
 module HT = Hashtbl
 
+(* the database encoding of values is slightly different from the AST's.
+ * Entries must be indexed by their corresponding atom and arity, and
+ * they might either point to clauses or facts, the later being a clause
+ * without a sequent (or with a tautological one). *)
 module Reg = struct
+
+  exception UndefinedValue
 
   open Ast
 
   type key = atom * int
 
-  type value = pred * arg option
+  type clause = pred * arg option (* optional sequent *)
+
+  type entry = clause list ref
 
   let mkkey = function
-    | Clause ({name;args},_)
-    | Pred {name;args} -> Some (name, List.length args)
+    | Clause ({ name;args },_)
+    | Pred { name;args } -> Some (name, List.length args)
     | Atom s           -> Some (s, 0)
     | Var  _           -> None
 
   let mkvalue = function
     | Pred p       -> p,None
     | Clause (p,s) -> p,Some s
-    | Atom name    -> Ast.{name;infix=false;args=[]}, None
+    | Atom name    -> Ast.{ name;infix=false;args=[] }, None
     | _            -> assert false
 
   type t = {
-    clauses : (key, value list ref) HT.t
+    clauses : (key, entry) HT.t
   }
 
   let make () = {
@@ -114,31 +123,34 @@ module Reg = struct
   let find r k =
     HT.find r.clauses k
 
-  let add_new r k v = 
+  let add_new r k v =
     HT.add r.clauses k (ref [mkvalue v])
+
+  let get_entry r k =
+    find r k
 
   let add_front r k v =
     try
-      let l = find r k in
+      let l = get_entry r k in
       l := mkvalue v::!l
     with Not_found -> add_new r k v
 
   let add_back r k v =
     try
-      let l = find r k in
+      let l = get_entry r k in
       l := !l @ [mkvalue v]
     with Not_found -> add_new r k v
-      
+
   let remove_all r k =
     HT.remove r.clauses k
 
   let remove_front r k =
     try
-      let l = find r k in
+      let l = get_entry r k in
       match !l with
       | [] -> ()
       | x::xs -> l := xs
-    with Not_found -> (* error: undefined clause *) ()
+    with Not_found -> raise UndefinedValue
 
   let remove_back r k =
     let rec drop_last l = function
@@ -146,26 +158,26 @@ module Reg = struct
       | [x] -> List.rev l
       | x::xs -> drop_last (x::l) xs in
     try
-      let l = find r k in
+      let l = get_entry r k in
       match !l with
       | [] -> ()
       | xs -> l := drop_last [] xs
-    with Not_found -> (* error : undefined clause *) ()
+    with Not_found -> raise UndefinedValue
 
   let find r k =
-    try Some !(find r k) with Not_found -> None
-      
+    try Some (find r k) with Not_found -> None
+
   module PP = struct
 
-    let entry ppf = function
-      | p, None   -> Ast.PP.term ppf (Pred p)
-      | p, Some s -> Ast.PP.term ppf (Clause (p,s))
+    let value ppf = function
+      | p, None   -> Format.fprintf ppf "%a\n" Ast.PP.term (Pred p)
+      | p, Some s -> Format.fprintf ppf "%a\n" Ast.PP.term (Clause (p,s))
 
-    let entry_list ppf k v =
-      Ast.PP.list "\n" entry ppf !v
-        
+    let entry ppf k v =
+      Ast.PP.list "\n" value ppf !v
+
     let pp ppf reg =
-      HT.iter (fun k v -> entry_list ppf k v) reg.clauses
+      HT.iter (fun k v -> entry ppf k v) reg.clauses
 
   end
 
@@ -185,18 +197,18 @@ module Parse = struct
   let dbg = dbg_false
 
   let mkbuff chan prompt =
-     {chan; parsing = false; prompt; b = Buffer.create 211; pos = 0; opened = true }
+    { chan; parsing = false; prompt; b = Buffer.create 211; pos = 0; opened = true }
 
   let fillbuff buff =
     if buff.pos >= Buffer.length buff.b && buff.opened
     then
       let rec fill buff =
         buff.prompt buff.parsing;
-        let buff = {buff with parsing = true} in 
-        try 
+        let buff = { buff with parsing = true } in
+        try
           match input_line buff.chan with
             "" -> fill buff
-          | b  -> Buffer.add_string buff.b b; 
+          | b  -> Buffer.add_string buff.b b;
                   buff
         with End_of_file -> { buff with opened = false }
       in
@@ -209,19 +221,19 @@ module Parse = struct
     let s = Buffer.sub buff.b buff.pos l in
     let b = Buffer.create l in
     Buffer.add_string b s;
-    { buff with b; pos = 0; parsing = false}
+    { buff with b; pos = 0; parsing = false }
 
   let clearbuff buff =
     Buffer.clear buff.b;
     { buff with pos = 0; parsing = false }
 
   let pos buff = buff.pos
-    
+
   let char buff =
     Buffer.nth buff.b buff.pos
 
   let next buff =
-    {buff with pos = succ buff.pos}
+    { buff with pos = succ buff.pos }
 
   let lexeme buff start =
     dbg "lexeme : %d %d %d@.%!" (Buffer.length buff.b) start buff.pos;
@@ -271,14 +283,14 @@ module Parse = struct
     and comment buff s =
       let buff = fillbuff buff in
       match buff.opened with
-      | false -> syntax_error buff "unterminated comment" 
+      | false -> syntax_error buff "unterminated comment"
       | _     -> match char buff with
                    '*'      -> end_comment (next buff) (succ s)
                  | _        -> comment (next buff) (succ s)
     and end_comment buff s =
       let buff = fillbuff buff in
       match buff.opened with
-      | false -> syntax_error buff "unterminated comment" 
+      | false -> syntax_error buff "unterminated comment"
       | _     -> match char buff with
                  | '/'      -> skip (next buff) (succ s)
                  | '*'      -> end_comment (next buff) (succ s)
@@ -290,8 +302,8 @@ module Parse = struct
       | _     -> match char buff with
                  | ' '      -> skip (next buff) (succ s)
                  | '/'      -> begin
-                   let buff = next buff in 
-                   match char buff with 
+                   let buff = next buff in
+                   match char buff with
                      '*' -> comment (next buff) (s + 2)
                    | _   -> loop atom buff s
                  end
@@ -326,8 +338,8 @@ module Parse = struct
     | `LPar   -> expr cont buff tk
     | `Atom x -> begin
       match token buff with
-      | `LPar,buff -> let tk, buff = token buff in list clause buff (end_functor cont x) tk
-      | tk   ,buff -> cont buff (atom x) tk
+      | `LPar, buff -> let tk, buff = token buff in list clause buff (end_functor cont x) tk
+      | tk   , buff -> cont buff (atom x) tk
     end
     | _       -> syntax_error buff "malformed term"
   and end_functor (cont :  (term,'a) cont) name buff (args : term list) tk : 'a =
@@ -381,7 +393,7 @@ module Parse = struct
       `Eof, buff -> raise Eof
     | tk, buff   -> term cont buff tk
 
-  let clause cont buff = 
+  let clause cont buff =
     let cont buff t = function
       | `Dot -> cont buff t
       | tk   -> let msg =  fmt_syntax_error_token "clause" tk in syntax_error buff msg in
@@ -401,8 +413,10 @@ module Subst = struct
     Ast.VarMap.is_empty m
 
   let pp ppf (m : t) =
-    let fld v t ppf = Format.fprintf ppf "%s = %a.@." v Ast.PP.term t; ppf in
-    ignore @@ Ast.VarMap.fold fld m ppf 
+    let open Ast in
+    let l = VarMap.bindings m in
+    let pp_pair ppf (v,t) = Format.fprintf ppf "%a = %a" PP.var v PP.term t in
+    Format.fprintf ppf "%a" (PP.list ",\n" pp_pair) l
 
   let add v p s =
     Ast.VarMap.add v p s
@@ -416,7 +430,7 @@ module Subst = struct
         Some _, Some v -> Some v
       | _ -> None
     in
-    Ast.VarMap.merge intersect vs s 
+    Ast.VarMap.merge intersect vs s
 
   module Plain = struct
 
@@ -449,7 +463,7 @@ module Subst = struct
       | Atom _       -> None
       | Var v        -> begin try Some (find v s) with Not_found -> None end
       | Pred p       -> opt_fg (pred_apply_opt s) (fun p -> Some (Pred p)) p
-      | Clause c     -> opt_fg (clause_apply_opt s) (fun c -> Some (Clause c)) c 
+      | Clause c     -> opt_fg (clause_apply_opt s) (fun c -> Some (Clause c)) c
     and pred_apply_opt s p =
       let fld a (l,b) = match term_apply_opt s a with
           None -> (a::l,b)
@@ -465,8 +479,8 @@ module Subst = struct
       | Some p, Some a -> Some (p,a)
 
     let subst_apply_opt s1 s2 =
-    (* Map.map will always return a value physically 
-     * different from its input, thus we'll keep track 
+    (* Map.map will always return a value physically
+     * different from its input, thus we'll keep track
      * manually of whether [s2] remains unmodified
      * (note: Batteries might be a better fit here) *)
       let modified = ref false in
@@ -485,21 +499,30 @@ module Subst = struct
 
   include Sharing
 
+  (* tries to compute the transitive closure of s,
+   * ie, replaces variables in terms by the ground term
+   * they associate with, if any *)
   let simplify s =
     let open Ast.VarMap in
-    let mergef k a b =
+    let merge_either k a b =
       match a, b with
         None, _ -> b
       | _, None -> a
       | _       -> assert false in
+    let merge_include k a b =
+      match a, b with
+        None, _ -> b
+      | _,    _ -> a in
     let rec loop gs s =
       (* find entries which are ground *)
       let gs', s' = partition (fun _ t -> Ast.term_ground t) s in
+      dbg "simplify : %a -> @[gs = %a@; s = %a@]@."
+        pp s pp gs' pp s';
       match is_empty gs' with
-      | true  -> merge mergef gs s
-      | false -> match subst_apply_opt gs s' with
-        | None    -> s
-        | Some s' -> loop gs s' in
+      | true  -> merge merge_either gs s
+      | false -> match subst_apply_opt gs' s' with
+        | None    -> merge merge_either gs s
+        | Some s' -> loop (merge merge_include gs gs') s' in
     loop empty s
 
 end (* Subst *)
@@ -520,7 +543,7 @@ module Unification = struct
     | p, Var v                       -> unify_var_term s p v
     | Pred p1, Pred p2               -> unify_pred s p1 p2
     | _,_                            -> None
-  and unify_pred s {name = n1; args = a1} {name = n2; args = a2} =
+  and unify_pred s { name = n1; args = a1 } { name = n2; args = a2 } =
     let unify_opt = function
       | None -> fun _ _ -> None
       | Some s -> fun a b -> unify s a b in
@@ -539,9 +562,14 @@ module Unification = struct
   and unify_var_term s p v =
     try unify s p (Subst.find v s)
     with Not_found -> Some (Subst.add v p s)
-      
+
 end (* Unification *)
 
+(* evaluation: evaluation of a term shall return:
+ * - the set of pairs of variables & terms which satisfies the term,
+ * - true if that set is empty,
+ * - or false if such set cannot be infered
+ *)
 module Eval = struct
 
   open Ast
@@ -557,9 +585,9 @@ module Eval = struct
       { reg = Reg.make (); sym = 0 }
 
     let name n ctx =
-      n ^ "_" ^ (string_of_int ctx.sym), {ctx with sym = succ ctx.sym }
+      n ^ "_" ^ (string_of_int ctx.sym), { ctx with sym = succ ctx.sym }
 
-    let rec rename vars apply ctx t = 
+    let rec rename vars apply ctx t =
       let vm = vars VarMap.empty t in
       let r = ref ctx in
       let mapf v =
@@ -567,217 +595,261 @@ module Eval = struct
         r := c; (Var n) in
       let vm = VarMap.map mapf vm in
       !r, apply vm t
-        
+
     let term_rename = rename Ast.term_vars Subst.term_apply
     and clause_rename = rename Ast.clause_vars Subst.clause_apply
-    and pred_rename  = rename Ast.pred_vars Subst.pred_apply 
+    and pred_rename  = rename Ast.pred_vars Subst.pred_apply
 
+    (* renaming of a reg entry *)
     let reg_rename ctx = function
-      | p, None -> let ctx, p = pred_rename ctx p in ctx, (p, None)
+      | p, None   -> let ctx, p = pred_rename ctx p in ctx, (p, None)
       | p, Some b -> let ctx, (p,b) = clause_rename ctx (p,b) in ctx, (p, Some b)
 
   end
 
   open Context
 
+  (* fix-me: turn these into predicates *)
   exception UndefinedPredicate of Reg.key
   exception Uninstantiated
   exception TypeError of string
+  exception StaticProcedure
 
   module Builtin = struct
 
-    let rec instantiate s = function
-      | Atom _ as a  -> a
-      | Var v  as a  -> begin
-        try Subst.find v s
-        with Not_found -> a
-      end
-      | Pred p       -> Pred (instantiate_pred s p)
-      | Clause (p,a) -> Clause (instantiate_pred s p, instantiate s a)
-    and instantiate_pred s {name;args;infix} =
-      {name; args = List.map (instantiate s) args; infix}
+    type 'a emit = Subst.t -> Context.t -> 'a
+    type 'a fail = Subst.t -> Context.t -> 'a
 
-    let true_ emit fail s ctx =
-      emit s ctx
+    type ('a,'b) t =
+      'a emit -> 'a fail -> Subst.t -> Context.t -> 'b list -> 'a
 
-    let false_ emit fail s ctx =
-      fail s ctx
+    module TblConf = struct
 
-    let ground emit fail s ctx t =
-      match Ast.term_ground t with
-        true -> emit s ctx
-      | _    -> fail s ctx
+      type t = Reg.key
 
-    let var emit fail s ctx t =
-      match t with
-      | Var _ -> emit s ctx
-      | _     -> fail s ctx
+      let equal (k1,i1) (k2,i2) = k1 == k2 && i1 = i2
 
-    let assertx add s ctx p =
-      match Reg.mkkey (instantiate s p) with
-      | None   -> raise Uninstantiated
-      | Some k -> add ctx.reg k p
+      let hash (k,i) = Hashtbl.hash k + i
 
-    let listing s ctx =
-      Format.eprintf "%a@.%!" Reg.PP.pp ctx.reg
+    end
 
-    let halt s ctx = Format.eprintf "@.See you soon!@."; exit 0
+    module Table = Hashtbl.Make(TblConf)
 
-    let unify emit fail s ctx a b =
-      match Unification.unify s a b with
-        Some bindings -> emit bindings ctx
-      | None          -> fail s ctx
+    let builtins : (unit,term) t Table.t = Table.create 211
 
-    (* consult loads a file by turning it into a buffer and
-       calling [assertx] above until error or EOF is reached *)
-    let rec consult eval s ctx p =
-      match instantiate s p with
-      | Atom fname -> 
-         let open Parse in
-         begin
-           try
-             let fname = if Filename.check_suffix fname ".pl" 
-               then fname
-               else fname^".pl" in
-             let chan = open_in fname in
-             let cont buff c =
-               let buff = updatebuff buff in
-               Format.eprintf "%a.@." Ast.PP.term c;
-               assertx Reg.add_back s ctx c;
-               buff in
-             let rec loop buff =
-               if buff.opened
-               then loop (Parse.clause cont buff) in
-             loop (mkbuff chan (function _ -> ()))
-           with 
-           | SyntaxError (buff, msg) -> 
-              Format.eprintf "syntax error (%d): %s@." buff.pos msg
-           | Eof -> ()
-         end
-        | _          -> raise Uninstantiated
+    let add k v =
+      Table.add builtins k v
 
-  end (* Builtin *)
+    let find r =
+      Table.find builtins r
 
-  (* evaluate a term by looking it up in the database *)
+  end
+
+  let rec instantiate s = function
+    | Atom _ as a  -> a
+    | Var v  as a  -> begin
+      try Subst.find v s
+      with Not_found -> a
+    end
+    | Pred p       -> Pred (instantiate_pred s p)
+    | Clause (p,a) -> Clause (instantiate_pred s p, instantiate s a)
+  and instantiate_pred s { name;args;infix } =
+    { name; args = List.map (instantiate s) args; infix }
+
+  let as_predicate = function
+    | Clause ({ name;args },_)
+    | Pred { name;args } -> Some ((name, List.length args), args)
+    | Atom s           -> Some ((s, 0), [])
+    | Var  _           -> None
+
+   (* evaluate a term by looking it up in the database:
+    * this function ought to be tail recursive, is it? *)
   let rec term emit fail s ctx (p : term) =
     (* builtin predicates *)
     dbg "Eval.term %a@." Ast.PP.term p;
     match p with
-    | Var _                -> raise Uninstantiated
-    | Pred {name=";";args} -> disj emit fail s ctx args
-    | Pred {name=",";args} -> conj emit fail s ctx args
-    | Pred {name="ground";args = [a]}  -> Builtin.ground emit fail s ctx a
-    | Pred {name="var";args = [a]}     -> Builtin.var emit fail s ctx a
-    | Pred {name="asserta";args = [a]} -> Builtin.assertx Reg.add_front s ctx a
-    | Pred {name="assertz";args = [a]} -> Builtin.assertx Reg.add_back s ctx a
-    | Pred {name="consult";args = [a]} -> Builtin.consult clause s ctx a
-    | Pred {name="="; args = [a;b]}    -> Builtin.unify emit fail s ctx a b
-    | Atom "true"    -> Builtin.true_ emit fail s ctx
-    | Atom "false"   -> Builtin.false_ emit fail s ctx
-    | Atom "listing" -> Builtin.listing s ctx
-    | Atom "halt"    -> Builtin.halt s ctx
+    | Var v  -> raise Uninstantiated
+    (* special builtins *)
+    | Pred { name=";";args } -> disj emit fail s ctx args
+    | Pred { name=",";args } -> conj emit fail s ctx args
     | _ ->
-       match Reg.mkkey p with
-       | None   -> assert false
-       | Some k ->
-          match Reg.find ctx.reg k with
-          | Some cs -> List.iter (clause emit fail s ctx (Builtin.instantiate s p)) cs
-          | None    -> raise (UndefinedPredicate k)
+       match as_predicate p with
+       | None       -> assert false
+       | Some (k,l) ->
+          try (Builtin.find k) emit fail s ctx l
+          with Not_found ->
+            match Reg.find ctx.reg k with
+            | Some e -> reg_entry emit fail s ctx (instantiate s p) !e
+            | None   -> raise (UndefinedPredicate k)
+  and reg_entry emit fail s ctx p = function
+    | [] -> assert false
+    | cs -> List.iter (clause emit (fun _ _ -> ()) s ctx p) cs; fail s ctx
   and clause emit fail s ctx p c =
     let ctx, (p',a') = Context.reg_rename ctx c in
     dbg "Eval.clause [%a] [%a :- %a]@." Ast.PP.term p Ast.PP.pred p' Ast.PP.(opt term) a';
+    dbg "s : @[%a@]@." Subst.pp s;
     match Unification.unify s p (Pred p'), a' with
     | Some bindings, Some body -> term emit fail bindings ctx body
     | Some bindings, None      -> emit bindings ctx
-    | None, _                  -> (* failure -> backtrack *) fail s ctx
+    | None, _                  -> fail s ctx
   and conj emit fail s ctx : term list -> unit = function
     | []    -> emit s ctx
     | x::xs -> term (fun s ctx -> conj emit fail s ctx xs) fail s ctx x
   and disj emit fail s ctx : term list -> unit = function
-    | []    -> fail s ctx
-    | x::xs -> term emit (fun s ctx -> disj emit fail s ctx xs) s ctx x
+    | [] -> assert false
+    | l  -> List.iter (term emit (fun _ _ -> ()) s ctx) l; fail s ctx
 
   exception Abort
 
   let rec continue () =
-    let l = input_line stdin in
-    if String.length l = 0
-    then continue ()
-    else match l.[0] with
-      ';' | 'n' | ' ' | '\t' -> ()
-    | _ -> raise Abort
+    let term_raw, term_cooked =
+      let attr = Unix.(tcgetattr stdin) in
+      (fun () -> Unix.(tcsetattr stdin TCSANOW { attr with c_icanon = false; c_echo = false })),
+      (fun () -> Unix.(tcsetattr stdin TCSAFLUSH attr)) in
+    term_raw ();
+    let c = input_char stdin in
+    term_cooked ();
+    match c with
+      ';' | 'n' | ' ' | '\t' -> Format.eprintf ";@."
+    | _ -> Format.eprintf ".@.%!"; raise Abort
 
-  (* top AST.term evaluation function: 
+  (* top AST.term evaluation function:
    * should 'emit' every working set of variables instantiations
-   * or fix-me: fail if none is found *)
-  let top reg p =
+   * or fail if none is found *)
+  let top ctx p =
     let vs = Ast.(term_vars VarMap.empty) p in
     let pp_result ppf s =
-      let s = Subst.intersect vs s in 
+      let s = Subst.simplify s in
+      let s = Subst.intersect vs s in
       match Subst.is_empty s with
         true -> Format.pp_print_string ppf "true."
-      | _    -> Subst.pp ppf s
+      | _    -> Format.fprintf ppf "%a " Subst.pp s
     in
     let emit s reg =
       Format.eprintf "%a%!" pp_result s;
       continue ()
-    in
-    try term emit (fun s reg -> ()) Subst.empty reg p
-    with Abort -> Format.eprintf "false.@.%!"
+    and fail s reg = Format.eprintf "false.@.%!" in
+    try term emit fail Subst.empty ctx p
+    with Abort -> ()
 
 end (* Eval *)
 
-(*
-module Runtime = struct
+module Builtins = struct
 
-  module Pred = struct
-    type t = { n : string; op : bool; arity : int }
-    let make n op arity = {n;op;arity}
-    let compare = compare
-  end
+  open Ast
+  open Eval
 
-  module Preds = Set.Make(Pred)
+  open Builtin
 
-  let preds = ref Preds.empty
+  let zero_arg f emit fail s ctx = function
+    | [] -> f emit fail s ctx ()
+    | _  -> assert false
 
-  let pred n op arity =
-    let p = Pred.make n op arity in
-    try Preds.find p !preds
-    with Not_found -> preds := Preds.add p !preds; p
+  let one_arg f emit fail s ctx = function
+    | [x] -> f emit fail s ctx x
+    | _ -> assert false
 
-  type pred    = Pred.t
-    
-  module Clause = struct
-    type t = { pred : pred; sequent : t }
-    let make pred sequent =  {pred; sequent }
-    let compare = compare
-  end
+  let two_args f emit fail s ctx = function
+    | [x1;x2] -> f emit fail s ctx x1 x2
+    | _ -> assert false
 
-  type clause  = Clause.t
+  let dummy_ s ctx = ()
 
-  type term    = Var of string | Clause of clause
+  let true_ emit fail s ctx _ =
+    emit s ctx
 
-  let ptrue  = pred "true" false 0
-  let pfalse = pred "false" false 0
-  let rec ctrue  = Clause.make ptrue ctrue
-  let rec cfalse = Clause.make pfalse cfalse
+  let false_ emit fail s ctx _ =
+    fail s ctx
 
-  let atom n =
-    let p = pred n false 0 in
-    Clause.make p ctrue
+  let ground emit fail s ctx t =
+    match Ast.term_ground t with
+      true -> emit s ctx
+    | _    -> fail s ctx
 
-  let rec compile = function
-    | Ast.Atom n -> Clause (atom n)
-    | Ast.Var s  -> Var s
-    | Ast.Pred {name; infix; args} -> 
-       
-end 
-*)
+  let var emit fail s ctx t =
+    match t with
+    | Var _ -> emit s ctx
+    | _     -> fail s ctx
+
+  let assertx add emit fail s ctx p =
+    match Reg.mkkey (instantiate s p) with
+    | None   -> raise Uninstantiated
+    | Some k ->
+       try let _ = Builtin.find k in raise StaticProcedure
+       with Not_found -> add ctx.Context.reg k p
+
+  (* fix-me: implement listing/1 *)
+  let listing emit fail s ctx _ =
+    Format.eprintf "%a@.%!" Reg.PP.pp ctx.Context.reg
+
+  let halt emit fail s ctx =
+    Format.eprintf "@.See you soon!@."; exit 0
+
+  let unify emit fail s ctx a b =
+    match Unification.unify s a b with
+      Some bindings -> emit bindings ctx
+    | None          -> fail s ctx
+
+  (* consult loads a file by turning it into a buffer and
+   * calling [assertx] above until error or EOF is reached.
+   * fix-me: implement ':-'/1 *)
+  let rec consult eval emit fail s ctx p =
+    match instantiate s p with
+    | Atom fname ->
+       let open Parse in
+       begin
+         try
+           let fname = if Filename.check_suffix fname ".pl"
+             then fname
+             else fname^".pl" in
+           let chan = open_in fname in
+           let cont buff c =
+             let buff = updatebuff buff in
+             Format.eprintf "%a.@." Ast.PP.term c;
+             assertx Reg.add_back emit fail s ctx c;
+             buff in
+           let rec loop buff =
+             if buff.opened
+             then loop (Parse.clause cont buff) in
+           loop (mkbuff chan (function _ -> ()))
+         with
+         | SyntaxError (buff, msg) ->
+            Format.eprintf "syntax error (%d): %s@." buff.pos msg
+         | Eof -> ()
+       end
+    | _          -> raise Uninstantiated
+
+end (* Builtins *)
+
+module Init = struct
+
+  open Builtins
+  open Eval
+
+  let string s = Ast.string @@ String.init (String.length s) (fun i -> s.[i])
+
+  let builtin_defs : (Reg.key * (unit,Ast.term) Builtin.t) list = [
+    (string "true",0),     (zero_arg true_);
+    (string "false",0),    (zero_arg false_);
+    (string "listing", 0), (zero_arg listing);
+    (string "halt", 0),    (zero_arg halt);
+    (string "ground",1),   (one_arg ground);
+    (string "var", 1),     (one_arg var);
+    (string "asserta",1),  (one_arg @@ assertx Reg.add_front);
+    (string "assertz",1),  (one_arg @@ assertx Reg.add_back);
+    (string "consult",1),  (one_arg @@ consult Eval.clause);
+  ]
+
+  let _ =
+    let iterf (k,v) = dbg "Init:%s@." (fst k); Builtin.add k v in
+    List.iter iterf builtin_defs
+
+end
 
 type state = {
   ctx  : Eval.Context.t;
   buff : Parse.buffer
-}
+ }
 
 let clearstate state =
   { state with buff = Parse.clearbuff state.buff }
@@ -785,21 +857,23 @@ let clearstate state =
 let parse cont state =
   let open Parse in
   try term cont state.buff
-  with 
-  | SyntaxError (buff, msg) -> 
+  with
+  | SyntaxError (buff, msg) ->
      Format.eprintf "syntax error (%d): %s@." buff.pos msg; clearstate { state with buff }
-  | Eof -> Eval.Builtin.halt Subst.empty state.ctx
+  | Eof -> Builtins.(halt dummy_ dummy_) Subst.empty state.ctx
+
+let eval_error ppf = let open Format in function
+  | Eval.UndefinedPredicate (a,i) -> fprintf ppf "undefined predicate %s/%d" a i
+  | Eval.Uninstantiated           -> fprintf ppf "unsufficiently instantiated value"
+  | Eval.StaticProcedure          -> fprintf ppf "cannot modify a static value"
+  | e -> raise e
 
 let rec repl state =
   let cont = fun buff t ->
     let state = { state with buff = Parse.updatebuff buff } in
     try Eval.top state.ctx t; state
-    with
-    | Eval.UndefinedPredicate (a,i) ->
-       Format.eprintf "undefined predicate %s/%d@." a i; 
-      clearstate state
-    | Eval.Uninstantiated           ->
-       Format.eprintf "unsufficiently instanciated value@.";
+    with e ->
+      Format.eprintf "evaluation error: %a@." eval_error e;
       clearstate state
   in
   let state = parse cont state in
@@ -811,13 +885,13 @@ let top ctx =
   repl state
 
 let load_file reg fname =
-  ignore (Eval.Builtin.consult Eval.clause Subst.empty reg (Ast.Atom fname))
+  ignore (Builtins.(consult dummy_ dummy_) Eval.clause Subst.empty reg (Ast.Atom fname))
 
 let _ =
   let ctx = Eval.Context.make () in
   match Sys.argv with
     [| _ |] -> top ctx
-  | _       -> 
+  | _       ->
      for i = 1 to pred @@ Array.length Sys.argv do
        load_file ctx Sys.argv.(i)
      done;
