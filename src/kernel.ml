@@ -38,15 +38,26 @@ module StringStore = struct
   let string x =
     IntMap.find store.strings x
 
-  let comma = atom ","
-  let semicolon = atom ";"
-  let turnstile = atom ":-"
+  let strue = "true"
+  let sfalse = "false"
+  let scomma = ","
+  let ssemicolon = ";"
+  let sturnstile = ":-"
+  let sequal = "="
+
+  let true_ = atom strue
+  let false_ = atom sfalse
+  let comma = atom scomma
+  let semicolon = atom ssemicolon
+  let turnstile = atom sturnstile
+  let equal = atom sequal
 
 end
 
 module Ast = struct
 
   type term   = Atom of atom | Var of var | Pred of pred | Clause of clause
+  and  op     = Xfx | Xfy | Yfx | Fx | Fy | Xf | Yf
 
   and  pred   = { name : atom; infix : bool; args : arg list }
   and  arg    = term
@@ -56,6 +67,7 @@ module Ast = struct
 
   let atom x = Atom (StringStore.atom x)
   let var x = Var x
+  let op x = StringStore.atom x
 
   let pred ?(infix=false) name args = Pred { name = StringStore.atom name;infix;args }
   let clause x y = Clause (x,y)
@@ -129,8 +141,8 @@ module Reg = struct
   let mkkey = function
     | Clause ({ name;args },_)
     | Pred { name;args } -> Some (name, List.length args)
-    | Atom s           -> Some (s, 0)
-    | Var  _           -> None
+    | Atom s             -> Some (s, 0)
+    | Var  _             -> None
 
   let mkvalue = function
     | Pred p       -> p,None
@@ -139,11 +151,13 @@ module Reg = struct
     | _            -> assert false
 
   type t = {
-    clauses : (key, entry) HT.t
+    clauses   : (key, entry) HT.t;
+    operators : (atom, Ast.op * int) HT.t
   }
 
   let make () = {
-    clauses = HT.create 211;
+    clauses   = HT.create 211;
+    operators = HT.create 11;
   }
 
   let find r k =
@@ -192,6 +206,28 @@ module Reg = struct
 
   let find r k =
     try Some (find r k) with Not_found -> None
+
+  (* there are several kinds of operators:
+   * f x
+   * f y    (left associative)
+   * x f
+   * y f    (right associative)
+   * x f x  (non associative)
+   * x f y  (reduce on the right)
+   * y f x  (reduce on the left)
+   **)
+  module Op = struct
+
+    let infix r o =
+      try Some (HT.find r.operators o) with Not_found -> None
+
+    let is_infix r o =
+      infix r o != None
+
+    let add r o k l =
+      HT.replace r.operators o (k,l)
+
+  end
 
   module PP = struct
     open Fmt
@@ -243,7 +279,7 @@ module Parse = struct
     else buff
 
   let updatebuff buff =
-    dbg "clearbuff : %d %d@.%!" (Buffer.length buff.b) buff.pos;
+    dbg "clearbuff : %d %d@\n%!" (Buffer.length buff.b) buff.pos;
     let l = Buffer.length buff.b - buff.pos  in
     let s = Buffer.sub buff.b buff.pos l in
     let b = Buffer.create l in
@@ -263,9 +299,9 @@ module Parse = struct
     { buff with pos = succ buff.pos }
 
   let lexeme buff start =
-    dbg "lexeme : %d %d %d@.%!" (Buffer.length buff.b) start buff.pos;
+    dbg "lexeme : %d %d %d@\n%!" (Buffer.length buff.b) start buff.pos;
     let l = Buffer.sub buff.b start (buff.pos - start) in
-    dbg "lexeme => %s@." l;
+    dbg "lexeme => %s@\n" l;
     l
 
   type token = [ `Dot | `Turnstile | `LPar | `RPar | `Op of string
@@ -276,9 +312,9 @@ module Parse = struct
     | `Turnstile -> fprintf ppf ":-"
     | `LPar      -> fprintf ppf "("
     | `RPar      -> fprintf ppf ")"
-    | `Op sym    -> fprintf ppf "%s" sym
-    | `Var s     -> fprintf ppf "%s" s
-    | `Atom s    -> fprintf ppf "%s" s
+    | `Op sym    -> fprintf ppf "OP %s" sym
+    | `Var s     -> fprintf ppf "VAR %s" s
+    | `Atom s    -> fprintf ppf "ATOM %s" s
     | `Eof       -> fprintf ppf "EOF"
 
   let var x = `Var x
@@ -292,6 +328,7 @@ module Parse = struct
 
   let syntax_error buff msg = raise @@ SyntaxError (buff,msg)
 
+  (* LEXER --- *)
   let token buff : token * buffer =
     let rec loop mk buff s =
       let buff = fillbuff buff in
@@ -347,9 +384,9 @@ module Parse = struct
                  | '('      -> `LPar, next buff
                  | ')'      -> `RPar, next buff
                  | '.'      -> `Dot , next buff
-                 | '='      -> `Op "=", next buff
-                 | ','      -> `Op ",", next buff
-                 | ';'      -> `Op ";", next buff
+                 | '='      -> `Op StringStore.sequal, next buff
+                 | ','      -> `Op StringStore.scomma, next buff
+                 | ';'      -> `Op StringStore.ssemicolon, next buff
                  | ':'      -> loop_turnstile (next buff) s
                  | _        -> loop atom (next buff) s in
     skip buff (pos buff)
@@ -358,6 +395,15 @@ module Parse = struct
 
   open Ast
 
+  (* PARSER --- *)
+
+  let reduce infix op1 op2 =
+    dbg " { reduce %s %s }@\n%!" op1 op2;
+    match infix op1, infix op2 with
+    | Some l1 , Some l2 -> (snd l1) <= (snd l2)
+    | Some _, None -> failwith "reduce operator 2"
+    | _ -> failwith "reduce operator 1"
+
   let rec list parse buff (cont : ('a list,'b) cont) tk : 'b =
     parse (cont_list parse cont []) buff tk
   and cont_list parse cont (l : 'a list) buff (o : 'a) tk =
@@ -365,54 +411,65 @@ module Parse = struct
       `Op "," -> let tk,buff = token buff in parse (cont_list parse cont (o::l)) buff tk
     | _       -> cont buff (List.rev (o::l)) tk
 
-  let rec term (cont : (term,'a) cont) buff tk : 'a =
+  let rec term infix (cont : (term,'a) cont) buff tk : 'a =
     let cont b x t =
       dbg "@]"; cont b x t in
-    dbg "term @[%!";
+    dbg "term @[<v>%!";
     match tk with
       `Var x  -> let tk, buff =  token buff in cont buff (Var x) tk
-    | `LPar   -> expr cont buff tk
+    | `LPar   -> expr infix (op infix cont) buff tk
     | `Atom x -> begin
       match token buff with
-      | `LPar, buff -> let tk, buff = token buff in list clause buff (end_functor cont x) tk
-      | tk   , buff -> cont buff (atom x) tk
+      | `LPar  , buff -> let tk, buff = token buff in list (clause infix) buff (end_functor infix cont x) tk
+      | tk     , buff -> cont buff (atom x) tk
     end
+    | `Op _     (* must be left unary *) 
     | _       -> syntax_error buff "malformed term"
-  and end_functor (cont :  (term,'a) cont) name buff (args : term list) tk : 'a =
+  and end_functor infix (cont :  (term,'a) cont) name buff (args : term list) tk : 'a =
     match tk with
       `RPar -> let tk, buff = token buff in cont buff (pred name args) tk
     | _     -> syntax_error buff "malformed predicate"
 
   (* handle infix notation *)
-  and expr (cont : (term,'a) cont) buff tk =
+  and expr infix (cont : (term,'a) cont) buff tk =
     let cont b x t =
       dbg "@]"; cont b x t in
-    dbg "expr @[%!";
+    dbg "expr @[<v>%!";
     match tk with
-    | `LPar -> let tk, buff = token buff in expr (expr_parens cont) buff tk
-    | _     -> clause (op cont) buff tk
-  and op cont buff s tk =
+    | `LPar -> let tk, buff = token buff in expr infix (expr_parens infix cont) buff tk
+    | _     -> clause infix cont buff tk
+  and op infix cont buff s tk =
+    dbg "op : %a %a@\n" Ast.PP.term s pp_token tk;
     match tk with
-      `Op sym    -> let tk, buff = token buff in expr (op_rhs sym cont s) buff tk
+      `Op sym    -> begin 
+        (* 2 possibilities: unary right -> reduce | _ -> check precedence *)
+        let tk, buff = token buff in expr infix (op_rhs infix sym cont s) buff tk
+      end
     | _          -> cont buff s tk
-  and op_rhs sym =
-    let pop s1 s2 = pred ~infix:true sym [s1;s2] in
-    fun cont s1 buff s2 tk ->
-      cont buff (pop s1 s2) tk
-  and expr_parens cont buff s = function
+  and op_rhs infix sym cont s1 buff s2 tk =
+    let is_infix o =
+      infix o != None in
+    let pop s1 s2 = pred ~infix:(is_infix sym) sym [s1;s2] in
+    dbg "op_rhs : %s %a %a %a" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
+    match tk with
+      `Op sym2 -> if reduce infix sym sym2
+        then (dbg "-> true@\n"; op infix cont buff (pop s1 s2) tk)
+        else (dbg "-> false@\n"; let tk, buff = token buff in expr infix (op_rhs infix sym2 (op_rhs infix sym cont s1) s2) buff tk)
+    | _ -> dbg "-> false@\n"; cont buff (pop s1 s2) tk
+  and expr_parens infix cont buff s = function
     | `RPar -> let tk, buff = token buff in cont buff s tk
     | tk    -> syntax_error buff "unbalanced parentheses"
 
-  and clause cont buff tk =
+  and clause infix cont buff tk =
     let cont b x t =
       dbg "@]"; cont b x t in
-    dbg "clause @[%!";
-    term (clause_cont cont) buff tk
-  and clause_cont cont buff (t : term) tk =
+    dbg "clause @[<v>%!";
+    term infix (clause_cont infix cont) buff tk
+  and clause_cont infix cont buff (t : term) tk =
     match t, tk with
-    | Pred p, `Turnstile -> let tk, buff = token buff in expr (clause_end cont p) buff tk
+    | Pred p, `Turnstile -> let tk, buff = token buff in expr infix (op infix @@ clause_end infix cont p) buff tk
     | _                  -> cont buff t tk
-  and clause_end cont p buff seq tk =
+  and clause_end infix cont p buff seq tk =
     cont buff (Ast.clause p seq) tk
 
   let fmt_syntax_error_token stg tk =
@@ -420,22 +477,22 @@ module Parse = struct
     Fmt.flush_str_formatter ()
 
   (* terms parser is used in the repl, clause parser is used in file loading *)
-  let term cont buff =
+  let term infix cont buff =
     let cont buff t = function
       | `Dot -> cont buff t
       | tk   -> let msg =  fmt_syntax_error_token "term" tk in
                 raise @@ SyntaxError (buff,msg) in
     match token buff with
       `Eof, buff -> raise Eof
-    | tk, buff   -> term cont buff tk
+    | tk, buff   -> term infix (op infix cont) buff tk
 
-  let clause cont buff =
+  let clause infix cont buff =
     let cont buff t = function
       | `Dot -> cont buff t
       | tk   -> let msg =  fmt_syntax_error_token "clause" tk in syntax_error buff msg in
     match token buff with
       `Eof, buff -> raise Eof
-    | tk, buff   -> clause cont buff tk
+    | tk, buff   -> clause infix cont buff tk
 
 end (* Parse *)
 
@@ -816,9 +873,15 @@ module Builtins = struct
     | _    -> fail s ctx
 
   let var emit fail s ctx t =
+    dbg "var@\n";
+    dbg "subst : @[<v>%a@]@\n" Subst.pp s;
     match t with
-    | Var _ -> emit s ctx
-    | _     -> fail s ctx
+    | Var v -> begin
+      try match Subst.find v s with
+      | Var _ -> true_ emit fail s ctx () | _ -> false_ emit fail s ctx ()
+      with Not_found -> true_ emit fail s ctx ()
+    end
+    | _     -> false_ emit fail s ctx ()
 
   let assertx add emit fail s ctx p =
     match Reg.mkkey (instantiate s p) with
@@ -828,7 +891,7 @@ module Builtins = struct
        with Not_found -> add ctx.Context.reg k p
 
   (* fix-me: implement listing/1 *)
-  let listing emit fail s ctx _ =
+  let listing_0 emit fail s ctx _ =
     Fmt.eprintf "%a@.%!" Reg.PP.pp ctx.Context.reg
 
   let halt emit fail s ctx =
@@ -838,6 +901,9 @@ module Builtins = struct
     match Unification.unify s a b with
       Some bindings -> emit bindings ctx
     | None          -> fail s ctx
+
+  let infix ctx o = Reg.Op.infix ctx.Context.reg (StringStore.atom o)
+  let is_infix ctx o = Reg.Op.is_infix ctx.Context.reg (StringStore.atom o)
 
   (* consult loads a file by turning it into a buffer and
    * calling [assertx] above until error or EOF is reached.
@@ -860,7 +926,7 @@ module Builtins = struct
              buff in
            let rec loop buff =
              if buff.opened
-             then loop (Parse.clause cont buff) in
+             then loop (Parse.clause (infix ctx) cont buff) in
            loop (mkbuff chan (function _ -> ()))
          with
          | SyntaxError (buff, msg) ->
@@ -879,21 +945,37 @@ module Init = struct
   (* store a copy (in the heap) of the string in the string dictionary *)
   let string s = StringStore.atom @@ String.init (String.length s) (fun i -> s.[i])
 
-  let builtin_defs : (Reg.key * (unit,Ast.term) Builtin.t) list = [
-    (string "true",0),     (zero_arg true_);
-    (string "false",0),    (zero_arg false_);
-    (string "listing", 0), (zero_arg listing);
-    (string "halt", 0),    (zero_arg halt);
-    (string "ground",1),   (one_arg ground);
-    (string "var", 1),     (one_arg var);
-    (string "asserta",1),  (one_arg @@ assertx Reg.add_front);
-    (string "assertz",1),  (one_arg @@ assertx Reg.add_back);
-    (string "consult",1),  (one_arg @@ consult Eval.clause);
+  let builtin_defs = [
+    (StringStore.true_,0),  (zero_arg true_);
+    (StringStore.false_,0), (zero_arg false_);
+    (string "listing", 0),  (zero_arg listing_0);
+    (string "halt", 0),     (zero_arg halt);
+    (string "ground",1),    (one_arg ground);
+    (string "var", 1),      (one_arg var);
+    (string "asserta",1),   (one_arg @@ assertx Reg.add_front);
+    (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
+    (string "consult",1),   (one_arg @@ consult Eval.clause);
+    (StringStore.equal,2),  (two_args unify);
   ]
 
-  let _ =
-    let iterf (k,v) = dbg "Init:%s@." (StringStore.string @@ fst k); Builtin.add k v in
-    List.iter iterf builtin_defs
+  (* fix-me: should be in a prelude file *)
+  let builtin_ops  = 
+    let open Ast in [
+    (StringStore.comma,     (Xfy,1000));
+    (StringStore.semicolon, (Xfy,1100));
+    (StringStore.turnstile, (Fx, 1200)); (* this is the unary turnstile used with consult/_ *)
+    (StringStore.equal,     (Xfx, 700)); (* unification operator *)
+  ]
+
+  let init ctx =
+    let iter_def (k,v) =
+      dbg "Init def:%s@\n" (StringStore.string @@ fst k); 
+      Builtin.add k v in
+    List.iter iter_def builtin_defs;
+    let iter_op (o,(k,l)) =
+      dbg "Init op:%s@\n" (StringStore.string o); 
+      Reg.Op.add ctx.Eval.Context.reg o k l in
+    List.iter iter_op builtin_ops
 
 end
 
@@ -907,7 +989,7 @@ let clearstate state =
 
 let parse cont state =
   let open Parse in
-  try term cont state.buff
+  try term (Builtins.infix state.ctx) cont state.buff
   with
   | SyntaxError (buff, msg) ->
      Fmt.eprintf "syntax error (%d): %s@." buff.pos msg; clearstate { state with buff }
@@ -939,12 +1021,26 @@ let load_file reg fname =
   let fname = StringStore.atom fname in
   ignore (Builtins.(consult dummy_ dummy_) Eval.clause Subst.empty reg (Ast.Atom fname))
 
+open Arg
+
+let load = ref []
+
+let push_load s = load := s::!load
+
+let cmd_specs = [
+  "-d", Set debug_on, "activate debugging display";
+]
+
+let usage s = s ^ ": [options] [files]"
+
 let _ =
+  Arg.parse cmd_specs push_load (usage Sys.argv.(0));
   let ctx = Eval.Context.make () in
-  match Sys.argv with
-    [| _ |] -> top ctx
-  | _       ->
-     for i = 1 to pred @@ Array.length Sys.argv do
-       load_file ctx Sys.argv.(i)
-     done;
-    top ctx
+  let () = Init.init ctx in
+  let () =
+    match !load with
+      [] -> ()
+    | l  -> List.iter (load_file ctx) @@ List.rev l
+  in
+  flush stderr;
+  top ctx
