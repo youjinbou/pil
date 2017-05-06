@@ -12,8 +12,8 @@ let debug_on = ref false
 let dbg_true = fun msg -> Fmt.eprintf msg
 let dbg_false = fun msg -> Fmt.(ifprintf err_formatter) msg
 
-let dbg =
-  if !debug_on then dbg_true else dbg_false
+let dbg msg =
+  if !debug_on then dbg_true msg else dbg_false msg
 
 type atom = int
 type var  = string
@@ -88,7 +88,6 @@ module Ast = struct
     let var ppf x = string ppf x
 
     let list sep = list ~pp_sep:(fun ppf () -> atom ppf sep)
-
 
     let rec pred ppf { name; infix; args } =
       match infix, args with
@@ -256,8 +255,6 @@ module Parse = struct
     pos     : int;
     opened  : bool;
   }
-
-  let dbg = dbg_false
 
   let mkbuff chan prompt =
     { chan; parsing = false; prompt; b = Buffer.create 211; pos = 0; opened = true }
@@ -453,10 +450,12 @@ module Parse = struct
     dbg "op_rhs : %s %a %a %a" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
     match tk with
       `Op sym2 -> if reduce infix sym sym2
-        then (dbg "-> true@\n"; op infix cont buff (pop s1 s2) tk)
-        else (dbg "-> false@\n"; let tk, buff = token buff in expr infix (op_rhs infix sym2 (op_rhs infix sym cont s1) s2) buff tk)
-    | _ -> dbg "-> false@\n"; cont buff (pop s1 s2) tk
-  and expr_parens infix cont buff s = function
+        then (op infix cont buff (pop s1 s2) tk)
+        else (let tk, buff = token buff in expr infix (op_rhs infix sym2 (op_rhs infix sym cont s1) s2) buff tk)
+    | _ -> cont buff (pop s1 s2) tk
+  and expr_parens infix cont buff s tk =
+    dbg "expr_parens@.";
+    match tk with
     | `RPar -> let tk, buff = token buff in cont buff s tk
     | tk    -> syntax_error buff "unbalanced parentheses"
 
@@ -468,7 +467,7 @@ module Parse = struct
   and clause_cont infix cont buff (t : term) tk =
     match t, tk with
     | Pred p, `Turnstile -> let tk, buff = token buff in expr infix (op infix @@ clause_end infix cont p) buff tk
-    | _                  -> cont buff t tk
+    | _                  -> op infix cont buff t tk
   and clause_end infix cont p buff seq tk =
     cont buff (Ast.clause p seq) tk
 
@@ -826,7 +825,7 @@ module Eval = struct
     let vs = Ast.(term_vars VarMap.empty) p in
     let pp_result ppf s =
       match Subst.is_empty s with
-        true -> Fmt.pp_print_string ppf "true.@.%!"; raise Abort
+        true -> Fmt.fprintf ppf "true%!"
       | _    -> Fmt.fprintf ppf "%a " Subst.pp s
     in
     let emit s reg =
