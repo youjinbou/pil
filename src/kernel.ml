@@ -349,7 +349,6 @@ module Parse = struct
   let turnstile x =
     if x = ":-" then `Turnstile else `Atom x
 
-
   type error =
       Eof
     | UnterminatedComment
@@ -368,7 +367,7 @@ module Parse = struct
     | UnbalancedParentheses  -> fmt "unbalanced parentheses"
     | UnexpectedToken token  -> fmt "unexpected token '%a'" pp_token token
     | Other (Sys_error s)    -> fmt "system error : %s" s
-    | Other _                -> fmt "unhandled error"
+    | Other e                -> raise e
 
   type ('a,'b) cont = 'a -> buffer -> token -> 'b
 
@@ -831,6 +830,13 @@ module Eval = struct
     dbg "Eval.term [%a]@." Ast.PP.term p;
     match p with
     | Var v  -> raise Uninstantiated
+    | Atom a -> let k = (a,0) in begin
+      try (Builtin.find k) emit fail s ctx []
+      with Not_found ->
+        match Reg.find ctx.reg k with
+        | Some e -> emit s ctx
+        | None   -> raise (UndefinedPredicate k)
+    end
     (* special builtins *)
     | Pred { name;args } when name == StringStore.semicolon -> disj term emit fail s ctx args
     | Pred { name;args } when name == StringStore.comma     -> conj term emit fail s ctx args
@@ -846,7 +852,7 @@ module Eval = struct
 
   exception Abort
 
-  let rec continue () =
+  let continue r =
     let term_raw, term_cooked =
       let attr = Unix.(tcgetattr stdin) in
       (fun () -> Unix.(tcsetattr stdin TCSANOW { attr with c_icanon = false; c_echo = false })),
@@ -856,15 +862,15 @@ module Eval = struct
       let c = input_char stdin in
       term_cooked ();
       match c with
-        ';' | 'n' | ' ' | '\t' -> Fmt.eprintf ";@."
-      | _ -> Fmt.eprintf ".@.%!"; raise Abort
+        ';' | 'n' | ' ' | '\t' -> ()
+      | _ -> raise Abort
     with End_of_file -> term_cooked (); exit 0
-
 
   (* top AST.term evaluation function:
    * should 'emit' every working set of variables instantiations
    * or fail if none is found *)
   let top ctx p =
+    let r = ref false in
     let vs = Ast.(term_vars VarMap.empty) p in
     let pp_result ppf s =
       match Subst.is_empty s with
@@ -872,13 +878,19 @@ module Eval = struct
       | _    -> Fmt.fprintf ppf "%a " Subst.pp s
     in
     let emit s reg =
+      if !r then Fmt.eprintf ";@.";
       let s = Subst.simplify s in
       let s = Subst.intersect vs s in
       Fmt.eprintf "%a%!" pp_result s;
-      continue ()
-    and fail s reg = Fmt.eprintf "false.@.%!" in
-    try term emit fail Subst.empty ctx p
-    with Abort -> ()
+      continue !r;
+      r := true
+    and fail s reg =
+      if !r then Fmt.eprintf ";@.false%!"
+      else Fmt.eprintf "false%!" in
+    let _ =
+      try term emit fail Subst.empty ctx p
+      with Abort -> () in
+    Fmt.eprintf ".@."
 
 end (* Eval *)
 
@@ -951,7 +963,7 @@ module Builtins = struct
   (* consult loads a file by turning it into a buffer and
    * calling [assertx] above until error or EOF is reached.
    * fix-me: implement ':-'/1 *)
-  let rec consult eval emit fail s ctx p =
+  let rec consult emit fail s ctx p =
     match instantiate s p with
     | Atom fname ->
        let open Parse in
@@ -960,18 +972,18 @@ module Builtins = struct
          then fname
          else fname^".pl" in
        let chan = open_in fname in
-       let fail buff = function
-         | Eof -> buff
-         | err -> Format.eprintf "syntax error (%d) : %a@." buff.pos pp_error err;
-           buff
+       let rec cfail buff = function
+         | Eof            -> true_ emit fail s ctx p
+         | Other _ as err -> Format.eprintf "%a" pp_error err; false_ emit fail s ctx p
+         | err            -> Format.eprintf "at pos %d, %a@." buff.pos pp_error err;
+                             false_ emit fail s ctx p
        and cont buff c =
          let buff = updatebuff buff in
          Fmt.eprintf "%a.@." Ast.PP.term c;
          assertx Reg.add_back emit fail s ctx c;
-         buff in
-       let rec loop buff =
-         if buff.opened
-         then loop (Parse.clause (infix ctx) cont fail buff) in
+         loop buff
+       and loop buff =
+         Parse.clause (infix ctx) cont cfail buff in
        loop (mkbuff chan (function _ -> ()))
     | _          -> raise Uninstantiated
 
@@ -980,7 +992,6 @@ end (* Builtins *)
 module Init = struct
 
   open Builtins
-  open Eval
 
   (* store a copy (in the heap) of the string in the string dictionary *)
   let string s = StringStore.atom @@ String.init (String.length s) (fun i -> s.[i])
@@ -994,7 +1005,7 @@ module Init = struct
     (string "var", 1),      (one_arg var);
     (string "asserta",1),   (one_arg @@ assertx Reg.add_front);
     (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
-    (string "consult",1),   (one_arg @@ consult Eval.clause);
+    (string "consult",1),   (one_arg @@ consult);
     (StringStore.equal,2),  (two_args unify);
   ]
 
@@ -1010,7 +1021,7 @@ module Init = struct
   let init ctx =
     let iter_def (k,v) =
       dbg "Init def:%s@\n" (StringStore.string @@ fst k); 
-      Builtin.add k v in
+      Eval.Builtin.add k v in
     List.iter iter_def builtin_defs;
     let iter_op (o,(k,l)) =
       dbg "Init op:%s@\n" (StringStore.string o); 
@@ -1060,7 +1071,7 @@ let top ctx =
 
 let load_file reg fname =
   let fname = StringStore.atom fname in
-  ignore (Builtins.(consult dummy_ dummy_) Eval.clause Subst.empty reg (Ast.Atom fname))
+  ignore (Builtins.(consult dummy_ dummy_) Subst.empty reg (Ast.Atom fname))
 
 open Arg
 
