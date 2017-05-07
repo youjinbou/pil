@@ -332,7 +332,7 @@ module Parse = struct
     l
 
   type token = [ `Dot | `Turnstile | `LPar | `RPar | `Op of string
-               | `Var of string | `Atom of string | `Eof ]
+               | `Var of string | `Atom of string ]
 
   let pp_token ppf = let open Fmt in function
     | `Dot       -> fprintf ppf "."
@@ -342,7 +342,6 @@ module Parse = struct
     | `Op sym    -> fprintf ppf "OP %s" sym
     | `Var s     -> fprintf ppf "VAR %s" s
     | `Atom s    -> fprintf ppf "ATOM %s" s
-    | `Eof       -> fprintf ppf "EOF"
 
   let var x = `Var x
   let atom x = `Atom x
@@ -350,80 +349,104 @@ module Parse = struct
   let turnstile x =
     if x = ":-" then `Turnstile else `Atom x
 
-  exception SyntaxError of buffer * string
-  exception Eof
 
-  let syntax_error buff msg = raise @@ SyntaxError (buff,msg)
+  type error =
+      Eof
+    | UnterminatedComment
+    | MalformedTerm
+    | MalformedPredicate
+    | UnbalancedParentheses
+    | UnexpectedToken of token
+    | Other of exn
+
+  let pp_error ppf =
+    let fmt msg = Fmt.fprintf ppf msg in function
+    | Eof                    -> fmt "unexpected end of stream" 
+    | UnterminatedComment    -> fmt "unterminated comment"
+    | MalformedTerm          -> fmt "malformed term"
+    | MalformedPredicate     -> fmt "malformed predicate"
+    | UnbalancedParentheses  -> fmt "unbalanced parentheses"
+    | UnexpectedToken token  -> fmt "unexpected token '%a'" pp_token token
+    | Other (Sys_error s)    -> fmt "system error : %s" s
+    | Other _                -> fmt "unhandled error"
+
+  type ('a,'b) cont = 'a -> buffer -> token -> 'b
+
+  let next_token buff fail cont =
+    try
+      let buff = fillbuff buff in
+      match buff.opened with
+        false -> fail buff Eof
+      | _     -> cont buff (char buff)
+    with exn -> fail buff (Other exn)
 
   (* LEXER --- *)
-  let token buff : token * buffer =
+  let token (type a) (cont : buffer -> token -> a) (fail : buffer -> error -> a) buff =
     let rec loop mk buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-        false -> mk (lexeme buff s), buff
-      | _     -> match char buff with
-                 | ','
-                 | ';'
-                 | '('
-                 | ')'
-                 | '.'
-                 | ':'
-                 | '='
-                 | ' ' -> mk (lexeme buff s), buff
-                 | _   -> loop mk (next buff) s
+      let fail buff = function
+        | Eof -> cont buff @@ mk (lexeme buff s)
+        | err -> fail buff err
+      and cont buff = function
+      | ','
+      | ';'
+      | '('
+      | ')'
+      | '.'
+      | ':'
+      | '='
+      | ' ' -> cont buff @@ mk (lexeme buff s)
+      | _   -> loop mk (next buff) s in
+      next_token buff fail cont
     and loop_turnstile buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-        false -> atom (lexeme buff s), buff
-      | _     -> match char buff with
-                 | '-' -> let buff = next buff in turnstile (lexeme buff s), buff
-                 | _   -> loop atom buff s
+     let fail buff = function
+        | Eof -> cont buff @@ atom (lexeme buff s)
+        | err -> fail buff err
+     and cont buff = function
+       | '-' -> let buff = next buff in cont buff @@ turnstile (lexeme buff s)
+       | _   -> loop atom buff s in
+      next_token buff fail cont
     and begin_comment buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-        false -> atom (lexeme buff s), buff
-      | _     -> match char buff with
-                 | '*' -> comment (next buff) (s + 2)
-                 | _   -> loop atom buff s
+      let fail buff = function
+        | Eof -> cont buff @@ atom (lexeme buff s)
+        | err -> fail buff err
+      and cont buff = function
+        | '*' -> comment (next buff) (s + 2)
+        | _   -> loop atom buff s in
+      next_token buff fail cont
     and comment buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-      | false -> syntax_error buff "unterminated comment"
-      | _     -> match char buff with
-                   '*'      -> end_comment (next buff) (succ s)
-                 | _        -> comment (next buff) (succ s)
+      let fail buff _ = fail buff UnterminatedComment
+      and cont buff = function
+        | '*'      -> end_comment (next buff) (succ s)
+        | _        -> comment (next buff) (succ s)
+      in next_token buff fail cont
     and end_comment buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-      | false -> syntax_error buff "unterminated comment"
-      | _     -> match char buff with
-                 | '/'      -> skip (next buff) (succ s)
-                 | '*'      -> end_comment (next buff) (succ s)
-                 | _        -> comment (next buff) (succ s)
+      let fail buff _ = fail buff UnterminatedComment
+      and cont buff = function
+        | '/'      -> skip (next buff) (succ s)
+        | '*'      -> end_comment (next buff) (succ s)
+        | _        -> comment (next buff) (succ s)
+      in next_token buff fail cont
     and skip buff s =
-      let buff = fillbuff buff in
-      match buff.opened with
-      | false -> `Eof, buff
-      | _     -> match char buff with
-                 | ' '      -> skip (next buff) (succ s)
-                 | '/'      -> begin_comment (next buff) s
-                 | 'A'..'Z' -> loop var (next buff) s
-                 | '('      -> `LPar, next buff
-                 | ')'      -> `RPar, next buff
-                 | '.'      -> `Dot , next buff
-                 | '='      -> `Op StringStore.sequal, next buff
-                 | ','      -> `Op StringStore.scomma, next buff
-                 | ';'      -> `Op StringStore.ssemicolon, next buff
-                 | ':'      -> loop_turnstile (next buff) s
-                 | _        -> loop atom (next buff) s in
+      let cont buff = function
+        | ' '      -> skip (next buff) (succ s)
+        | '/'      -> begin_comment (next buff) s
+        | 'A'..'Z' -> loop var (next buff) s
+        | '('      -> cont (next buff) `LPar
+        | ')'      -> cont (next buff) `RPar
+        | '.'      -> cont (next buff) `Dot 
+        | '='      -> cont (next buff) @@ `Op StringStore.sequal
+        | ','      -> cont (next buff) @@ `Op StringStore.scomma
+        | ';'      -> cont (next buff) @@ `Op StringStore.ssemicolon
+        | ':'      -> loop_turnstile (next buff) s
+        | _        -> loop atom (next buff) s in
+      next_token buff fail cont in
     skip buff (pos buff)
-
-  type ('a,'b) cont = buffer -> 'a -> token -> 'b
 
   open Ast
 
   (* PARSER --- *)
 
+  (* handling operator precedence and associativity *)
   let reduce infix op1 op2 =
     dbg " { reduce %s %s }@\n%!" op1 op2;
     match infix op1, infix op2 with
@@ -431,97 +454,87 @@ module Parse = struct
     | Some _, None -> failwith "reduce operator 2"
     | _ -> failwith "reduce operator 1"
 
-  let rec list parse buff (cont : ('a list,'b) cont) tk : 'b =
-    parse (cont_list parse cont []) buff tk
-  and cont_list parse cont (l : 'a list) buff (o : 'a) tk =
+  let rec list parse (cont : ('a list,'b) cont) fail buff tk : 'b =
+    parse (cont_list parse cont fail []) fail buff tk
+  and cont_list parse cont fail (l : 'a list) (o : 'a) buff tk =
     match tk with
-      `Op "," -> let tk,buff = token buff in parse (cont_list parse cont (o::l)) buff tk
-    | _       -> cont buff (List.rev (o::l)) tk
+      `Op "," -> token (parse (cont_list parse cont fail (o::l)) fail) fail buff
+    | _       -> cont (List.rev (o::l)) buff tk
 
-  let rec term infix (cont : (term,'a) cont) buff tk : 'a =
+  let rec term infix (cont : (term,'a) cont) fail buff tk : 'a =
     let cont b x t =
       dbg "@]"; cont b x t in
     dbg "term @[<v>%!";
     match tk with
-      `Var x  -> let tk, buff =  token buff in cont buff (Var x) tk
-    | `LPar   -> expr infix (op infix cont) buff tk
-    | `Atom x -> begin
-      match token buff with
-      | `LPar  , buff -> let tk, buff = token buff in list (clause infix) buff (end_functor infix cont x) tk
-      | tk     , buff -> cont buff (atom x) tk
-    end
+      `Var x  -> token (cont (Var x)) fail buff
+    | `LPar   -> expr infix (op infix cont fail) fail buff tk
+    | `Atom x -> token (begin_functor infix cont fail x) fail buff
     | `Op _     (* must be left unary *) 
-    | _       -> syntax_error buff "malformed term"
-  and end_functor infix (cont :  (term,'a) cont) name buff (args : term list) tk : 'a =
+    | _       -> fail buff MalformedTerm
+  and begin_functor infix cont fail x buff = function
+    | `LPar -> token (list (clause infix) (end_functor infix cont fail x) fail) fail buff
+    | tk    -> cont (atom x) buff tk
+  and end_functor infix (cont :  (term,'a) cont) fail name (args : term list) buff tk : 'a =
     match tk with
-      `RPar -> let tk, buff = token buff in cont buff (pred name args) tk
-    | _     -> syntax_error buff "malformed predicate"
+      `RPar -> token (cont (pred name args)) fail buff
+    | _     -> fail buff MalformedPredicate
 
   (* handle infix notation *)
-  and expr infix (cont : (term,'a) cont) buff tk =
+  and expr infix (cont : (term,'a) cont) fail buff tk =
     let cont b x t =
       dbg "@]"; cont b x t in
     dbg "expr @[<v>%!";
     match tk with
-    | `LPar -> let tk, buff = token buff in expr infix (expr_parens infix cont) buff tk
-    | _     -> clause infix cont buff tk
-  and op infix cont buff s tk =
+    | `LPar -> token (expr infix (expr_parens infix cont fail) fail) fail buff
+    | _     -> clause infix cont fail buff tk
+  and op infix cont fail s buff tk =
     dbg "op : %a %a@\n" Ast.PP.term s pp_token tk;
     match tk with
       `Op sym    -> begin 
         (* 2 possibilities: unary right -> reduce | _ -> check precedence *)
-        let tk, buff = token buff in expr infix (op_rhs infix sym cont s) buff tk
+        token (expr infix (op_rhs infix sym cont fail s) fail) fail buff
       end
-    | _          -> cont buff s tk
-  and op_rhs infix sym cont s1 buff s2 tk =
+    | _          -> cont s buff tk
+  and op_rhs infix sym cont fail s1 s2 buff tk =
     let is_infix o =
       infix o != None in
     let pop s1 s2 = pred ~infix:(is_infix sym) sym [s1;s2] in
     dbg "op_rhs : %s %a %a %a" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
     match tk with
       `Op sym2 -> if reduce infix sym sym2
-        then (op infix cont buff (pop s1 s2) tk)
-        else (let tk, buff = token buff in expr infix (op_rhs infix sym2 (op_rhs infix sym cont s1) s2) buff tk)
-    | _ -> cont buff (pop s1 s2) tk
-  and expr_parens infix cont buff s tk =
+        then (op infix cont fail (pop s1 s2) buff tk)
+        else token (expr infix (op_rhs infix sym2 (op_rhs infix sym cont fail s1) fail s2) fail) fail buff
+    | _ -> cont (pop s1 s2) buff tk
+  and expr_parens infix cont fail s buff tk =
     dbg "expr_parens@.";
     match tk with
-    | `RPar -> let tk, buff = token buff in cont buff s tk
-    | tk    -> syntax_error buff "unbalanced parentheses"
+    | `RPar -> token (cont s) fail buff
+    | tk    -> fail buff UnbalancedParentheses
 
-  and clause infix cont buff tk =
+  and clause infix cont fail buff tk =
     let cont b x t =
       dbg "@]"; cont b x t in
     dbg "clause @[<v>%!";
-    term infix (clause_cont infix cont) buff tk
-  and clause_cont infix cont buff (t : term) tk =
+    term infix (clause_cont infix cont fail) fail buff tk
+  and clause_cont infix cont fail (t : term) buff tk =
     match t, tk with
-    | Pred p, `Turnstile -> let tk, buff = token buff in expr infix (op infix @@ clause_end infix cont p) buff tk
-    | _                  -> op infix cont buff t tk
-  and clause_end infix cont p buff seq tk =
-    cont buff (Ast.clause p seq) tk
-
-  let fmt_syntax_error_token stg tk =
-    Fmt.(fprintf str_formatter) "unexpected token '%a' at end of %s" pp_token tk stg;
-    Fmt.flush_str_formatter ()
+    | Pred p, `Turnstile -> token (expr infix (op infix (clause_end infix cont fail p) fail) fail) fail buff
+    | _                  -> op infix cont fail t buff tk
+  and clause_end infix cont fail p seq buff tk =
+    cont (Ast.clause p seq) buff tk
 
   (* terms parser is used in the repl, clause parser is used in file loading *)
-  let term infix cont buff =
-    let cont buff t = function
+  let term infix cont fail buff =
+    let cont t buff = function
       | `Dot -> cont buff t
-      | tk   -> let msg =  fmt_syntax_error_token "term" tk in
-                raise @@ SyntaxError (buff,msg) in
-    match token buff with
-      `Eof, buff -> raise Eof
-    | tk, buff   -> term infix (op infix cont) buff tk
+      | tk   -> fail buff (UnexpectedToken tk) in
+    token (term infix (op infix cont fail) fail) fail buff
 
-  let clause infix cont buff =
-    let cont buff t = function
+  let clause infix cont fail buff =
+    let cont t buff = function
       | `Dot -> cont buff t
-      | tk   -> let msg =  fmt_syntax_error_token "clause" tk in syntax_error buff msg in
-    match token buff with
-      `Eof, buff -> raise Eof
-    | tk, buff   -> clause infix cont buff tk
+      | tk   -> fail buff (UnexpectedToken tk) in
+    token (clause infix cont fail) fail buff
 
 end (* Parse *)
 
@@ -942,27 +955,24 @@ module Builtins = struct
     match instantiate s p with
     | Atom fname ->
        let open Parse in
-       begin
-         try
-           let fname = StringStore.string fname in
-           let fname = if Filename.check_suffix fname ".pl"
-             then fname
-             else fname^".pl" in
-           let chan = open_in fname in
-           let cont buff c =
-             let buff = updatebuff buff in
-             Fmt.eprintf "%a.@." Ast.PP.term c;
-             assertx Reg.add_back emit fail s ctx c;
-             buff in
-           let rec loop buff =
-             if buff.opened
-             then loop (Parse.clause (infix ctx) cont buff) in
-           loop (mkbuff chan (function _ -> ()))
-         with
-         | SyntaxError (buff, msg) ->
-            Fmt.eprintf "syntax error (%d): %s@." buff.pos msg
-         | Eof -> ()
-       end
+       let fname = StringStore.string fname in
+       let fname = if Filename.check_suffix fname ".pl"
+         then fname
+         else fname^".pl" in
+       let chan = open_in fname in
+       let fail buff = function
+         | Eof -> buff
+         | err -> Format.eprintf "syntax error (%d) : %a@." buff.pos pp_error err;
+           buff
+       and cont buff c =
+         let buff = updatebuff buff in
+         Fmt.eprintf "%a.@." Ast.PP.term c;
+         assertx Reg.add_back emit fail s ctx c;
+         buff in
+       let rec loop buff =
+         if buff.opened
+         then loop (Parse.clause (infix ctx) cont fail buff) in
+       loop (mkbuff chan (function _ -> ()))
     | _          -> raise Uninstantiated
 
 end (* Builtins *)
@@ -1019,11 +1029,12 @@ let clearstate state =
 
 let parse cont state =
   let open Parse in
-  try term (Builtins.infix state.ctx) cont state.buff
-  with
-  | SyntaxError (buff, msg) ->
-     Fmt.eprintf "syntax error (%d): %s@." buff.pos msg; clearstate { state with buff }
-  | Eof -> Builtins.(halt dummy_ dummy_) Subst.empty state.ctx
+  let fail buff =
+    function
+    | Eof -> Builtins.(halt dummy_ dummy_) Subst.empty state.ctx
+    | err -> Fmt.eprintf "syntax error (%d): %a@." buff.pos pp_error err;
+      clearstate { state with buff } in
+  term (Builtins.infix state.ctx) cont fail state.buff
 
 let eval_error ppf = let open Fmt in function
   | Eval.UndefinedPredicate (a,i) -> fprintf ppf "undefined predicate %s/%d" (StringStore.string a) i
