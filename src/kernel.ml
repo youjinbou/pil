@@ -7,13 +7,40 @@ end
 
 module HT = Hashtbl
 
-let debug_on = ref false
+module CmdLine = struct
 
-let dbg_true = fun msg -> Fmt.eprintf msg
-let dbg_false = fun msg -> Fmt.(ifprintf err_formatter) msg
+  open Arg
 
-let dbg msg =
-  if !debug_on then dbg_true msg else dbg_false msg
+  let specs_ = ref []
+
+  let add_params l =
+    specs_ := l @ !specs_
+
+  let specs () = !specs_
+
+end
+
+module Debug = struct
+
+  let is_active = ref false
+
+  let activate () =
+    is_active := true
+
+  let dbg_true = fun msg -> Fmt.eprintf msg
+  let dbg_false = fun msg -> Fmt.(ifprintf err_formatter) msg
+
+  let printf msg =
+    if !is_active then dbg_true msg else dbg_false msg
+
+  let _ =
+    CmdLine.add_params [
+      "-d", Arg.Unit activate, "activate debugging display";
+    ]
+
+end
+
+let dbg = Debug.printf
 
 type atom = int
 type var  = string
@@ -230,6 +257,9 @@ module Reg = struct
 
   module PP = struct
     open Fmt
+
+    let key ppf (a,i) =
+      fprintf ppf "(%a,%d)" Ast.PP.atom a i
 
     let value ppf = function
       | p, None   -> fprintf ppf "%a" Ast.PP.term (Pred p)
@@ -886,8 +916,9 @@ module Builtins = struct
     match Reg.mkkey (instantiate s p) with
     | None   -> raise Uninstantiated
     | Some k ->
-       try let _ = Builtin.find k in raise StaticProcedure
-       with Not_found -> add ctx.Context.reg k p
+       dbg "assertx : @[term = %a@] [key = %a@]@." Ast.PP.term p Reg.PP.key k;
+      try let _ = Builtin.find k in raise StaticProcedure
+      with Not_found -> add ctx.Context.reg k p
 
   (* fix-me: implement listing/1 *)
   let listing_0 emit fail s ctx _ =
@@ -1026,14 +1057,10 @@ let load = ref []
 
 let push_load s = load := s::!load
 
-let cmd_specs = [
-  "-d", Set debug_on, "activate debugging display";
-]
-
 let usage s = s ^ ": [options] [files]"
 
 let _ =
-  Arg.parse cmd_specs push_load (usage Sys.argv.(0));
+  Arg.parse (CmdLine.specs ()) push_load (usage Sys.argv.(0));
   let ctx = Eval.Context.make () in
   let () = Init.init ctx in
   let () =
