@@ -81,6 +81,8 @@ module StringStore = struct
 
 end
 
+module ST = StringStore
+
 module Ast = struct
 
   type term   = Atom of atom | Var of var | Pred of pred | Clause of clause
@@ -92,12 +94,15 @@ module Ast = struct
 
   type phrase = term
 
-  let atom x = Atom (StringStore.atom x)
+  let atom x = Atom (ST.atom x)
   let var x = Var x
-  let op x = StringStore.atom x
+  let op x = ST.atom x
 
-  let pred ?(infix=false) name args = Pred { name = StringStore.atom name;infix;args }
-  let clause x y = Clause (x,y)
+  let pred ?(infix=false) name args =
+    match name, args with
+      ":-", [Pred a;b] -> Clause (a,b)
+    | ":-", [Atom a;b] -> Clause ({name = a; infix=false; args=[]}, b)
+    | _                -> Pred { name = ST.atom name;infix;args }
 
   module VarMap = Map.Make(struct type t = var let compare = compare end)
 
@@ -111,7 +116,7 @@ module Ast = struct
       | None   -> fprintf ppf "None"
       | Some x -> fprintf ppf "Some %a" ppv x
 
-    let atom ppf x = string ppf (StringStore.string x)
+    let atom ppf x = string ppf (ST.string x)
     let var ppf x = string ppf x
 
     let list sep = list ~pp_sep:(fun ppf () -> atom ppf sep)
@@ -119,7 +124,7 @@ module Ast = struct
     let rec pred ppf { name; infix; args } =
       match infix, args with
       |    _, [] -> fprintf ppf "%a" atom name
-      | true,  _ -> fprintf ppf "%a" (list name term) args
+      (*      | true,  _ -> fprintf ppf "%a" (list name term) args *)
       | _        -> fprintf ppf "%a(%a)" atom name (list_sep "," term) args
     and term ppf = function
       | Atom a -> atom ppf a
@@ -170,6 +175,9 @@ module Reg = struct
     | Atom s             -> Some (s, 0)
     | Var  _             -> None
 
+  let keyname = fst
+  let keyarity = snd
+
   let mkvalue = function
     | Pred p       -> p,None
     | Clause (p,s) -> p,Some s
@@ -178,7 +186,7 @@ module Reg = struct
 
   type t = {
     clauses   : (key, entry) HT.t;
-    operators : (atom, Ast.op * int) HT.t
+    operators : (key, Ast.op * int) HT.t
   }
 
   let make () = {
@@ -259,17 +267,17 @@ module Reg = struct
     open Fmt
 
     let key ppf (a,i) =
-      fprintf ppf "(%a,%d)" Ast.PP.atom a i
+      fprintf ppf "%a/%d" Ast.PP.atom a i
 
     let value ppf = function
       | p, None   -> fprintf ppf "%a" Ast.PP.term (Pred p)
       | p, Some s -> fprintf ppf "%a" Ast.PP.term (Clause (p,s))
 
-    let entry ppf k v =
-      list ~pp_sep:(cut ";") value ppf !v
+    let entry ppf (k,v) =
+      list ~pp_sep:(cut ".") value ppf !v
 
     let pp ppf reg =
-      HT.iter (fun k v -> entry ppf k v) reg.clauses
+      HT.iter (fun k v -> fprintf ppf "%a.@." entry (k,v)) reg.clauses
 
   end
 
@@ -278,16 +286,19 @@ end (* Reg *)
 module Parse = struct
 
   type buffer = {
+    fname   : string;
     chan    : in_channel;
     parsing : bool;
     prompt  : bool -> unit;
     b       : Buffer.t;
+    line    : int;
+    col     : int;
     pos     : int;
     opened  : bool;
   }
 
-  let mkbuff chan prompt =
-    { chan; parsing = false; prompt; b = Buffer.create 211; pos = 0; opened = true }
+  let mkbuff fname chan prompt =
+    { fname; chan; parsing = false; prompt; b = Buffer.create 211; line = 0; col = 0; pos = 0; opened = true }
 
   let fillbuff buff =
     if buff.pos >= Buffer.length buff.b && buff.opened
@@ -299,6 +310,7 @@ module Parse = struct
           match input_line buff.chan with
             "" -> fill buff
           | b  -> Buffer.add_string buff.b b;
+                  Buffer.add_string buff.b "\n";
                   buff
         with End_of_file -> { buff with opened = false }
       in
@@ -317,13 +329,15 @@ module Parse = struct
     Buffer.clear buff.b;
     { buff with pos = 0; parsing = false }
 
+  let newline buff = { buff with line = succ buff.line; col = 0 }
+
   let pos buff = buff.pos
 
   let char buff =
     Buffer.nth buff.b buff.pos
 
   let next buff =
-    { buff with pos = succ buff.pos }
+    { buff with pos = succ buff.pos; col = succ buff.col }
 
   let lexeme buff start =
     dbg "lexeme : %d %d %d@\n%!" (Buffer.length buff.b) start buff.pos;
@@ -331,12 +345,11 @@ module Parse = struct
     dbg "lexeme => %s@\n" l;
     l
 
-  type token = [ `Dot | `Turnstile | `LPar | `RPar | `Op of string
+  type token = [ `LPar | `RPar | `Op of string | `Dot
                | `Var of string | `Atom of string ]
 
   let pp_token ppf = let open Fmt in function
     | `Dot       -> fprintf ppf "."
-    | `Turnstile -> fprintf ppf ":-"
     | `LPar      -> fprintf ppf "("
     | `RPar      -> fprintf ppf ")"
     | `Op sym    -> fprintf ppf "OP %s" sym
@@ -345,29 +358,34 @@ module Parse = struct
 
   let var x = `Var x
   let atom x = `Atom x
+  let operator x = `Op x
 
   let turnstile x =
-    if x = ":-" then `Turnstile else `Atom x
+    if x = ":-" then `Op (ST.sturnstile)  else `Op x
 
   type error =
       Eof
+    | UnexpectedInput
     | UnterminatedComment
     | MalformedTerm
     | MalformedPredicate
     | UnbalancedParentheses
     | UnexpectedToken of token
+    | OperatorAssocMismatch
     | Other of exn
 
   let pp_error ppf =
     let fmt msg = Fmt.fprintf ppf msg in function
-    | Eof                    -> fmt "unexpected end of stream" 
-    | UnterminatedComment    -> fmt "unterminated comment"
-    | MalformedTerm          -> fmt "malformed term"
-    | MalformedPredicate     -> fmt "malformed predicate"
-    | UnbalancedParentheses  -> fmt "unbalanced parentheses"
-    | UnexpectedToken token  -> fmt "unexpected token '%a'" pp_token token
-    | Other (Sys_error s)    -> fmt "system error : %s" s
-    | Other e                -> raise e
+    | Eof                     -> fmt "unexpected end of stream"
+    | UnexpectedInput         -> fmt "unexpected character"
+    | UnterminatedComment     -> fmt "unterminated comment"
+    | MalformedTerm           -> fmt "malformed term"
+    | MalformedPredicate      -> fmt "malformed predicate"
+    | UnbalancedParentheses   -> fmt "unbalanced parentheses"
+    | UnexpectedToken token   -> fmt "unexpected token '%a'" pp_token token
+    | OperatorAssocMismatch   -> fmt "operator associativity mismatch"
+    | Other (Sys_error s)     -> fmt "system error : %s" s
+    | Other e                 -> raise e
 
   type ('a,'b) cont = 'a -> buffer -> token -> 'b
 
@@ -380,64 +398,87 @@ module Parse = struct
     with exn -> fail buff (Other exn)
 
   (* LEXER --- *)
+
+  (* special characters : [ ] [\t] [,] [;] [(] [)] [']  *)
+
   let token (type a) (cont : buffer -> token -> a) (fail : buffer -> error -> a) buff =
-    let rec loop mk buff s =
-      let fail buff = function
-        | Eof -> cont buff @@ mk (lexeme buff s)
-        | err -> fail buff err
-      and cont buff = function
-      | ','
-      | ';'
-      | '('
-      | ')'
-      | '.'
-      | ':'
-      | '='
-      | ' ' -> cont buff @@ mk (lexeme buff s)
-      | _   -> loop mk (next buff) s in
-      next_token buff fail cont
-    and loop_turnstile buff s =
-     let fail buff = function
-        | Eof -> cont buff @@ atom (lexeme buff s)
-        | err -> fail buff err
-     and cont buff = function
-       | '-' -> let buff = next buff in cont buff @@ turnstile (lexeme buff s)
-       | _   -> loop atom buff s in
-      next_token buff fail cont
+    let efail mk s buff = function
+      | Eof -> cont buff @@ mk (lexeme buff s)
+      | err -> fail buff err
+    and cfail buff _ = fail buff UnterminatedComment
+    in
+    let rec loop_op buff s =
+      let cont buff = function
+        | ':' | '&' | '=' | '#' | '|' | '\\'
+        | '<' | '>' | '+' | '-' | '*' | '/'  -> loop_op (next buff) s
+        | _ -> cont buff @@ operator (lexeme buff s) in
+      next_token buff (efail operator s) cont
+    and loop_alphanum mk buff s =
+      let cont buff = function
+        | 'A'..'Z' | 'a'..'z'
+        | '0'..'9' | '_' | '-'  -> loop_alphanum mk (next buff) s
+      | _   -> cont buff @@ mk (lexeme buff s)
+      in next_token buff (efail mk s) cont
+    and begin_quoted mk buff s =
+      let cont buff = function
+        (* special case for double quote op *)
+        | '\'' -> let buff = next buff in cont buff @@ operator (lexeme buff s)
+        (* otherwise quoted atom/operator *)
+        | _    -> quoted mk (next buff) (succ s)
+      in next_token buff fail cont
+    and quoted mk buff s =
+      let cont buff = function
+        (* we don't keep the quotes *)
+        | '\'' -> cont (next buff) @@ mk (lexeme buff s)
+        | _    -> quoted mk (next buff) s
+      in next_token buff fail cont
     and begin_comment buff s =
-      let fail buff = function
-        | Eof -> cont buff @@ atom (lexeme buff s)
-        | err -> fail buff err
-      and cont buff = function
+      let cont buff = function
         | '*' -> comment (next buff) (s + 2)
-        | _   -> loop atom buff s in
-      next_token buff fail cont
+        | _   -> loop_op buff s in
+      next_token buff (efail atom s) cont
     and comment buff s =
-      let fail buff _ = fail buff UnterminatedComment
-      and cont buff = function
+      let cont buff = function
         | '*'      -> end_comment (next buff) (succ s)
         | _        -> comment (next buff) (succ s)
-      in next_token buff fail cont
+      in next_token buff cfail cont
     and end_comment buff s =
-      let fail buff _ = fail buff UnterminatedComment
-      and cont buff = function
+      let cont buff = function
         | '/'      -> skip (next buff) (succ s)
         | '*'      -> end_comment (next buff) (succ s)
         | _        -> comment (next buff) (succ s)
+      in next_token buff cfail cont
+    and dot buff s =
+      let fail buff = function
+        | Eof -> cont buff `Dot
+        | err -> fail buff err
+      and cont buff = function
+        | ' ' | '\t' | '\n' | ','
+        | ';' | '(' | ')' | '\'' -> dbg "lexeme => .@\n"; cont buff `Dot
+        | _ -> loop_op (next buff) s
       in next_token buff fail cont
     and skip buff s =
       let cont buff = function
-        | ' '      -> skip (next buff) (succ s)
+        (* spaces => skip to next char *)
+        | '\n'           -> skip (next @@ newline buff) (succ s)
+        | ' '   | '\t'   -> skip (next buff) (succ s)
+        (* special chars *)
+        | '('      -> dbg "lexeme => (@\n"; cont (next buff) `LPar
+        | ')'      -> dbg "lexeme => )@\n"; cont (next buff) `RPar
+        | ','      -> dbg "lexeme => ,@\n"; cont (next buff) @@ `Op ST.scomma
+        | ';'      -> dbg "lexeme => ;@\n"; cont (next buff) @@ `Op ST.ssemicolon
         | '/'      -> begin_comment (next buff) s
-        | 'A'..'Z' -> loop var (next buff) s
-        | '('      -> cont (next buff) `LPar
-        | ')'      -> cont (next buff) `RPar
-        | '.'      -> cont (next buff) `Dot 
-        | '='      -> cont (next buff) @@ `Op StringStore.sequal
-        | ','      -> cont (next buff) @@ `Op StringStore.scomma
-        | ';'      -> cont (next buff) @@ `Op StringStore.ssemicolon
-        | ':'      -> loop_turnstile (next buff) s
-        | _        -> loop atom (next buff) s in
+        (* quoted atom *)
+        | '\''     -> begin_quoted atom (next buff) s
+        (* operators -- which characters are allowed? *)
+        | '.'      -> dot (next buff) s
+        | ':' | '&' | '=' | '#' | '|' | '\\'
+        | '<' | '>' | '+' | '-' | '*' -> loop_op (next buff) s
+        (* variables *)
+        | 'A'..'Z' -> loop_alphanum var (next buff) s
+        (* atoms *)
+        | 'a'..'z' -> loop_alphanum atom (next buff) s
+        | _        -> fail buff UnexpectedInput in
       next_token buff fail cont in
     skip buff (pos buff)
 
@@ -445,95 +486,159 @@ module Parse = struct
 
   (* PARSER --- *)
 
+  let compare_assoc a1 a2 =
+    match a1, a2 with
+    | (Fx | Xfx | Yfx), (Yf | Yfx) ->  1 (* for equal precedence, x is reduced first *)
+    | (Fy | Xfy), (Xf | Xfx | Xfy) -> -1
+    | (Fy | Xfy), (Yf | Yfx)       ->  0
+    | (Fx | Xfx | Yfx), (Xfx | Xfy | Xf) -> 0
+    | (Xf | Yf), _ ->  1
+    | _, (Fx | Fy) -> -1
+
   (* handling operator precedence and associativity *)
   let reduce infix op1 op2 =
-    dbg " { reduce %s %s }@\n%!" op1 op2;
+    let pp_op ppf (a,b) = Fmt.fprintf ppf "%s/%d" a b in
+    dbg " { reduce %a %a }@\n%!" pp_op op1 pp_op op2;
     match infix op1, infix op2 with
-    | Some l1 , Some l2 -> (snd l1) <= (snd l2)
+    | Some (a1,p1) , Some (a2,p2) ->
+       begin
+       match compare p1 p2, compare_assoc a1 a2 with
+         0, 0 -> `FAIL
+       | 0, k
+       | k, _ -> if k < 0 then `REDUCE else `SHIFT
+       end
     | Some _, None -> failwith "reduce operator 2"
     | _ -> failwith "reduce operator 1"
 
-  let rec list parse (cont : ('a list,'b) cont) fail buff tk : 'b =
-    parse (cont_list parse cont fail []) fail buff tk
-  and cont_list parse cont fail (l : 'a list) (o : 'a) buff tk =
-    match tk with
-      `Op "," -> token (parse (cont_list parse cont fail (o::l)) fail) fail buff
-    | _       -> cont (List.rev (o::l)) buff tk
+  (* fix-me: undefined operator could be a simple atom?*)
+  (* note: within functors, comma's meaning changes *)
 
-  let rec term infix (cont : (term,'a) cont) fail buff tk : 'a =
-    let cont b x t =
-      dbg "@]"; cont b x t in
-    dbg "term @[<v>%!";
-    match tk with
-      `Var x  -> token (cont (Var x)) fail buff
-    | `LPar   -> expr infix (op infix cont fail) fail buff tk
-    | `Atom x -> token (begin_functor infix cont fail x) fail buff
-    | `Op _     (* must be left unary *) 
-    | _       -> fail buff MalformedTerm
-  and begin_functor infix cont fail x buff = function
-    | `LPar -> token (list (clause infix) (end_functor infix cont fail x) fail) fail buff
-    | tk    -> cont (atom x) buff tk
-  and end_functor infix (cont :  (term,'a) cont) fail name (args : term list) buff tk : 'a =
-    match tk with
-      `RPar -> token (cont (pred name args)) fail buff
-    | _     -> fail buff MalformedPredicate
-
-  (* handle infix notation *)
-  and expr infix (cont : (term,'a) cont) fail buff tk =
-    let cont b x t =
-      dbg "@]"; cont b x t in
-    dbg "expr @[<v>%!";
-    match tk with
-    | `LPar -> token (expr infix (expr_parens infix cont fail) fail) fail buff
-    | _     -> clause infix cont fail buff tk
-  and op infix cont fail s buff tk =
-    dbg "op : %a %a@\n" Ast.PP.term s pp_token tk;
-    match tk with
-      `Op sym    -> begin 
-        (* 2 possibilities: unary right -> reduce | _ -> check precedence *)
-        token (expr infix (op_rhs infix sym cont fail s) fail) fail buff
-      end
-    | _          -> cont s buff tk
-  and op_rhs infix sym cont fail s1 s2 buff tk =
-    let is_infix o =
-      infix o != None in
-    let pop s1 s2 = pred ~infix:(is_infix sym) sym [s1;s2] in
-    dbg "op_rhs : %s %a %a %a" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
-    match tk with
-      `Op sym2 -> if reduce infix sym sym2
-        then (op infix cont fail (pop s1 s2) buff tk)
-        else token (expr infix (op_rhs infix sym2 (op_rhs infix sym cont fail s1) fail s2) fail) fail buff
-    | _ -> cont (pop s1 s2) buff tk
-  and expr_parens infix cont fail s buff tk =
-    dbg "expr_parens@.";
-    match tk with
-    | `RPar -> token (cont s) fail buff
-    | tk    -> fail buff UnbalancedParentheses
-
-  and clause infix cont fail buff tk =
-    let cont b x t =
-      dbg "@]"; cont b x t in
-    dbg "clause @[<v>%!";
-    term infix (clause_cont infix cont fail) fail buff tk
-  and clause_cont infix cont fail (t : term) buff tk =
-    match t, tk with
-    | Pred p, `Turnstile -> token (expr infix (op infix (clause_end infix cont fail p) fail) fail) fail buff
-    | _                  -> op infix cont fail t buff tk
-  and clause_end infix cont fail p seq buff tk =
-    cont (Ast.clause p seq) buff tk
-
-  (* terms parser is used in the repl, clause parser is used in file loading *)
   let term infix cont fail buff =
+    let rec term fnctr cont fail buff tk =
+      let cont b x t =
+        dbg "@]"; cont b x t in
+      dbg "@[term %a@\n" pp_token tk;
+      match tk with
+      (* handle prefix ops *)
+      | `Op u     -> begin
+        match infix (u,1) with
+        | Some ((Fx| Fy), _) -> token (term fnctr (op1_rhs fnctr u cont fail) fail) fail buff
+        | tk                 -> fail buff MalformedTerm
+      end
+      | `Var x    -> token (cont (Var x)) fail buff
+      | `LPar     -> token (term false (op false (close_parens (op fnctr cont fail) fail) fail) fail) fail buff
+      | `Atom x   -> token (begin_functor cont fail x) fail buff
+      | _         -> fail buff MalformedTerm
+    and op fnctr cont fail s buff tk =
+      dbg "op : %b %a %a@\n" fnctr Ast.PP.term s pp_token tk;
+      match tk with
+      | `Op sym    -> begin
+        match sym, fnctr, infix (sym,2) with
+        | ",", true, _  -> (* functor comma *)
+           token (term fnctr (op2_reduce fnctr sym cont fail s) fail) fail buff
+        | _,_,Some _ -> (* binary operator *) 
+           token (term fnctr (op2_rhs fnctr sym cont fail s) fail) fail buff
+        | _ -> (* else try unary *)
+           match infix (sym,1) with
+           | Some ((Xf|Yf), _) -> token (term fnctr (op1_reduce fnctr sym cont fail) fail) fail buff
+           | Some ((Fx|Fy), _) -> fail buff MalformedTerm
+           | _                 -> cont s buff tk
+      end
+      | _          -> cont s buff tk
+    and op2_reduce fnctr sym cont fail s1 s2 buff tk =
+      op fnctr cont fail (pred ~infix:true sym [s1;s2]) buff tk 
+    and op1_reduce fnctr sym cont fail s1 buff tk =
+      op fnctr cont fail (pred ~infix:false sym [s1]) buff tk 
+    and op2_rhs fnctr sym cont fail s1 s2 buff tk =
+      let pop2 s1 s2 = pred ~infix:true sym [s1;s2] in
+      let reduce o2 rcont scont =
+          match reduce infix (sym,2) o2 with
+            `FAIL   -> fail buff OperatorAssocMismatch
+          | `REDUCE -> rcont ()
+          | `SHIFT  -> scont ()
+      in
+      dbg "op2_rhs : %s %a %a %a@\n" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
+      match tk, fnctr with
+      | `Op ",", true  -> cont (pop2 s1 s2) buff tk
+      | `Op sym2, _    ->
+         begin
+           let scont1 () =
+             token (op2_rhs fnctr sym cont fail s1 (pred sym2 [s2])) fail buff
+           and scont2 () =
+             token (term fnctr (op2_rhs fnctr sym2 (op2_rhs fnctr sym cont fail s1) fail s2) fail) fail buff
+           and rcont () =
+             token (term fnctr (op2_rhs fnctr sym2 cont fail (pop2 s1 s2)) fail) fail buff
+           in
+          match infix (sym2,2), infix (sym2,1) with
+          | Some _, Some _  -> (* both exists: we should try first binary,
+                                * and if no term follow downgrade to unary *)
+             fail buff OperatorAssocMismatch
+          | Some _, None    -> (* only binary *)
+             reduce (sym2,2) rcont scont2
+          | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
+             reduce (sym2,2) rcont scont1
+          | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
+             fail buff OperatorAssocMismatch
+          | _                      -> (* no such operator *)
+             cont (pop2 s1 s2) buff tk
+        end
+      | _ -> cont (pop2 s1 s2) buff tk
+    and op1_rhs fnctr (sym : string) cont fail s1 buff tk =
+      let pop1 s = pred sym [s] in
+      let reduce o2 rcont scont =
+          match reduce infix (sym,1) o2 with
+            `FAIL   -> fail buff OperatorAssocMismatch
+          | `REDUCE -> rcont ()
+          | `SHIFT  -> scont ()
+      in
+      dbg "op1_rhs : %s %a %a@\n" sym Ast.PP.term s1 pp_token tk;
+      match tk with
+      | `Op ","  when fnctr -> cont (pop1 s1) buff tk
+      | `Op sym2            ->
+         begin
+           let scont1 () =
+             token (cont (pred sym [pred sym2 [s1]])) fail buff
+           and scont2 () =
+             token (term fnctr (op2_rhs fnctr sym2 (op1_rhs fnctr sym cont fail) fail s1) fail) fail buff
+           and rcont () =
+             token (term fnctr (op2_rhs fnctr sym cont fail (pred sym2 [s1])) fail) fail buff
+           in
+          match infix (sym2,2), infix (sym2,1) with
+          | Some _, Some _  -> (* both exists: we should try first binary,
+                                * and if no term follow downgrade to unary *)
+             fail buff OperatorAssocMismatch
+          | Some _, None    -> (* only binary *)
+             reduce (sym2,2) rcont scont2
+          | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
+             reduce (sym2,2) rcont scont1
+          | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
+          fail buff OperatorAssocMismatch
+          | _                      -> (* no such operator *)
+             cont (pop1 s1) buff tk
+        end
+      | _ -> cont (pop1 s1) buff tk
+    and begin_functor cont fail x buff tk =
+      dbg "begin_functor %a@\n" pp_token tk;
+      match tk with
+      | `LPar -> token (term true (end_functor cont fail x []) fail) fail buff
+      | _     -> cont (atom x) buff tk
+    and end_functor (cont :  (term,'a) cont) fail name args a buff tk =
+      dbg "end_functor %a@\n" pp_token tk;
+      match tk with
+      | `RPar   -> token (cont (pred name (List.rev @@ a::args))) fail buff
+      | `Op "," -> token (term true (end_functor cont fail name (a::args)) fail) fail buff
+      | `Op _   -> op true (end_functor cont fail name args) fail a buff tk
+      | _       -> fail buff MalformedPredicate
+    and close_parens cont fail s buff tk =
+      dbg "expr_parens@\n";
+      match tk with
+      | `RPar -> token (cont s) fail buff
+      | tk    -> fail buff UnbalancedParentheses
+    in
     let cont t buff = function
       | `Dot -> cont buff t
       | tk   -> fail buff (UnexpectedToken tk) in
-    token (term infix (op infix cont fail) fail) fail buff
-
-  let clause infix cont fail buff =
-    let cont t buff = function
-      | `Dot -> cont buff t
-      | tk   -> fail buff (UnexpectedToken tk) in
-    token (clause infix cont fail) fail buff
+    token (term false (op false cont fail) fail) fail buff
 
 end (* Parse *)
 
@@ -751,7 +856,7 @@ module Eval = struct
   exception UndefinedPredicate of Reg.key
   exception Uninstantiated
   exception TypeError of string
-  exception StaticProcedure
+  exception StaticProcedure of Reg.key
 
   type 'a emit = Subst.t -> Context.t -> 'a
   type 'a fail = Subst.t -> Context.t -> 'a
@@ -838,8 +943,8 @@ module Eval = struct
         | None   -> raise (UndefinedPredicate k)
     end
     (* special builtins *)
-    | Pred { name;args } when name == StringStore.semicolon -> disj term emit fail s ctx args
-    | Pred { name;args } when name == StringStore.comma     -> conj term emit fail s ctx args
+    | Pred { name;args } when name == ST.semicolon -> disj term emit fail s ctx args
+    | Pred { name;args } when name == ST.comma     -> conj term emit fail s ctx args
     | _ ->
        match as_predicate p with
        | None       -> assert false
@@ -941,9 +1046,9 @@ module Builtins = struct
     match Reg.mkkey (instantiate s p) with
     | None   -> raise Uninstantiated
     | Some k ->
-       dbg "assertx : @[term = %a@] [key = %a@]@." Ast.PP.term p Reg.PP.key k;
-      try let _ = Builtin.find k in raise StaticProcedure
-      with Not_found -> add ctx.Context.reg k p
+       dbg "assertx : @[term = %a@] [key = %a]@]@.%!" Ast.PP.term p Reg.PP.key k;
+      try let _ = Builtin.find k in raise (StaticProcedure k)
+      with Not_found -> add ctx.Context.reg k p; true_ emit fail s ctx ()
 
   (* fix-me: implement listing/1 *)
   let listing_0 emit fail s ctx _ =
@@ -957,8 +1062,8 @@ module Builtins = struct
       Some bindings -> emit bindings ctx
     | None          -> fail s ctx
 
-  let infix ctx o = Reg.Op.infix ctx.Context.reg (StringStore.atom o)
-  let is_infix ctx o = Reg.Op.is_infix ctx.Context.reg (StringStore.atom o)
+  let infix ctx (o,i) = Reg.Op.infix ctx.Context.reg (ST.atom o,i)
+  let is_infix ctx (o,i) = Reg.Op.is_infix ctx.Context.reg (ST.atom o,i)
 
   (* consult loads a file by turning it into a buffer and
    * calling [assertx] above until error or EOF is reached.
@@ -967,7 +1072,7 @@ module Builtins = struct
     match instantiate s p with
     | Atom fname ->
        let open Parse in
-       let fname = StringStore.string fname in
+       let fname = ST.string fname in
        let fname = if Filename.check_suffix fname ".pl"
          then fname
          else fname^".pl" in
@@ -975,7 +1080,7 @@ module Builtins = struct
        let rec cfail buff = function
          | Eof            -> true_ emit fail s ctx p
          | Other _ as err -> Format.eprintf "%a" pp_error err; false_ emit fail s ctx p
-         | err            -> Format.eprintf "at pos %d, %a@." buff.pos pp_error err;
+         | err            -> Format.eprintf "in '%s' at pos [%d,%d], %a@." buff.fname buff.line buff.col pp_error err;
                              false_ emit fail s ctx p
        and cont buff c =
          let buff = updatebuff buff in
@@ -983,8 +1088,8 @@ module Builtins = struct
          assertx Reg.add_back emit fail s ctx c;
          loop buff
        and loop buff =
-         Parse.clause (infix ctx) cont cfail buff in
-       loop (mkbuff chan (function _ -> ()))
+         Parse.term (infix ctx) cont cfail buff in
+       loop (mkbuff fname chan (function _ -> ()))
     | _          -> raise Uninstantiated
 
 end (* Builtins *)
@@ -994,11 +1099,11 @@ module Init = struct
   open Builtins
 
   (* store a copy (in the heap) of the string in the string dictionary *)
-  let string s = StringStore.atom @@ String.init (String.length s) (fun i -> s.[i])
+  let string s = ST.atom @@ String.init (String.length s) (fun i -> s.[i])
 
   let builtin_defs = [
-    (StringStore.true_,0),  (zero_arg true_);
-    (StringStore.false_,0), (zero_arg false_);
+    (ST.true_,0),  (zero_arg true_);
+    (ST.false_,0), (zero_arg false_);
     (string "listing", 0),  (zero_arg listing_0);
     (string "halt", 0),     (zero_arg halt);
     (string "ground",1),    (one_arg ground);
@@ -1006,25 +1111,26 @@ module Init = struct
     (string "asserta",1),   (one_arg @@ assertx Reg.add_front);
     (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
     (string "consult",1),   (one_arg @@ consult);
-    (StringStore.equal,2),  (two_args unify);
+    (ST.equal,2),  (two_args unify);
   ]
 
   (* fix-me: should be in a prelude file *)
-  let builtin_ops  = 
+  let builtin_ops  =
     let open Ast in [
-    (StringStore.comma,     (Xfy,1000));
-    (StringStore.semicolon, (Xfy,1100));
-    (StringStore.turnstile, (Fx, 1200)); (* this is the unary turnstile used with consult/_ *)
-    (StringStore.equal,     (Xfx, 700)); (* unification operator *)
+    ((ST.comma,2),     (Xfy,1000));
+    ((ST.semicolon,2), (Xfy,1100));
+    ((ST.turnstile,2), (Xfx,1200));
+    (*    (ST.turnstile, (Fx, 1200)); (* this is the unary turnstile used with consult/_ *) *)
+    ((ST.equal,2),     (Xfx, 700)); (* unification operator *)
   ]
 
   let init ctx =
     let iter_def (k,v) =
-      dbg "Init def:%s@\n" (StringStore.string @@ fst k); 
+      dbg "Init def:%a@\n" Reg.PP.key k;
       Eval.Builtin.add k v in
     List.iter iter_def builtin_defs;
     let iter_op (o,(k,l)) =
-      dbg "Init op:%s@\n" (StringStore.string o); 
+      dbg "Init op:%a@\n" Reg.PP.key o;
       Reg.Op.add ctx.Eval.Context.reg o k l in
     List.iter iter_op builtin_ops
 
@@ -1048,9 +1154,9 @@ let parse cont state =
   term (Builtins.infix state.ctx) cont fail state.buff
 
 let eval_error ppf = let open Fmt in function
-  | Eval.UndefinedPredicate (a,i) -> fprintf ppf "undefined predicate %s/%d" (StringStore.string a) i
-  | Eval.Uninstantiated           -> fprintf ppf "unsufficiently instantiated value"
-  | Eval.StaticProcedure          -> fprintf ppf "cannot modify a static value"
+  | Eval.UndefinedPredicate k   -> fprintf ppf "undefined predicate %a" Reg.PP.key k
+  | Eval.Uninstantiated         -> fprintf ppf "unsufficiently instantiated value"
+  | Eval.StaticProcedure k      -> fprintf ppf "cannot modify static value %a" Reg.PP.key k
   | e -> raise e
 
 let rec repl state =
@@ -1066,11 +1172,11 @@ let rec repl state =
 
 let top ctx =
   let prompt = function true -> Fmt.printf "| %!" | _ -> Fmt.printf "?- %!" in
-  let state = { ctx; buff = Parse.mkbuff stdin prompt } in
+  let state = { ctx; buff = Parse.mkbuff "interactive" stdin prompt } in
   repl state
 
 let load_file reg fname =
-  let fname = StringStore.atom fname in
+  let fname = ST.atom fname in
   ignore (Builtins.(consult dummy_ dummy_) Subst.empty reg (Ast.Atom fname))
 
 open Arg
@@ -1086,9 +1192,11 @@ let _ =
   let ctx = Eval.Context.make () in
   let () = Init.init ctx in
   let () =
-    match !load with
-      [] -> ()
-    | l  -> List.iter (load_file ctx) @@ List.rev l
+    try
+      match !load with
+        [] -> ()
+      | l  -> List.iter (load_file ctx) @@ List.rev l
+    with e -> Fmt.eprintf "load error: %a@." eval_error e
   in
   flush stderr;
   top ctx
