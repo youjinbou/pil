@@ -79,13 +79,23 @@ module StringStore = struct
   let turnstile = atom sturnstile
   let equal = atom sequal
 
+  module Arith = struct
+
+    let sops = ["+"; "*"; "-"; "/"]
+    let ops =  List.map atom sops
+
+    let spreds = [ ">"; "<"; ">="; "=<"; "=:=" ]
+    let preds = List.map atom spreds
+
+  end
+
 end
 
 module ST = StringStore
 
 module Ast = struct
 
-  type term   = Atom of atom | Var of var | Pred of pred | Clause of clause
+  type term   = Atom of atom | Int of int | Var of var | Pred of pred | Clause of clause
   and  op     = Xfx | Xfy | Yfx | Fx | Fy | Xf | Yf
   and  pred   = { name : atom; infix : bool; args : arg list }
   and  arg    = term
@@ -93,6 +103,7 @@ module Ast = struct
 
   type phrase = term
 
+  let int x = Int x
   let atom x = Atom (ST.atom x)
   let var x = Var x
   let op x = ST.atom x
@@ -105,6 +116,7 @@ module Ast = struct
 
   let rec term_bound v = function
     | Var x    -> x = v
+    | Int _    -> false
     | Atom _   -> false
     | Pred p   -> pred_bound v p
     | Clause c -> clause_bound v c
@@ -125,6 +137,7 @@ module Ast = struct
       | None   -> fprintf ppf "None"
       | Some x -> fprintf ppf "Some %a" ppv x
 
+    let int ppf x = fprintf ppf "%d" x
     let atom ppf x = string ppf (ST.string x)
     let var ppf (i,x) = if i = -1 then string ppf x else fprintf ppf "%s_%d" x i
 
@@ -137,6 +150,7 @@ module Ast = struct
       | _        -> fprintf ppf "%a(%a)" atom name (list_sep "," term) args
     and term ppf = function
       | Atom a -> atom ppf a
+      | Int x  -> int ppf x
       | Var v  -> var ppf v
       | Pred p -> pred ppf p
       | Clause (p,s) -> fprintf ppf "%a :- %a" pred p term s
@@ -150,6 +164,7 @@ module Ast = struct
 
   let rec term_vars l = function
     | Atom _ -> l
+    | Int _  -> l
     | Var v  -> VarMap.add v v l
     | Pred p -> pred_vars l p
     | Clause (p,t) -> clause_vars l (p,t)
@@ -185,6 +200,7 @@ module Reg = struct
     | Pred { name;args } -> Some (name, List.length args)
     | Atom s             -> Some (s, 0)
     | Var  _             -> None
+    | Int  _             -> None
 
   let keyname = fst
   let keyarity = snd
@@ -348,7 +364,7 @@ module Parse = struct
     l
 
   type token = [ `LPar | `RPar | `Op of string | `Dot
-               | `Var of string | `Atom of string ]
+               | `Var of string | `Atom of string | `Scalar of string ]
 
   let pp_token ppf = let open Fmt in function
     | `Dot       -> fprintf ppf "."
@@ -357,10 +373,12 @@ module Parse = struct
     | `Op sym    -> fprintf ppf "OP %s" sym
     | `Var s     -> fprintf ppf "VAR %s" s
     | `Atom s    -> fprintf ppf "ATOM %s" s
+    | `Scalar s  -> fprintf ppf "SCALAR %s" s
 
   let var x = `Var x
   let atom x = `Atom x
   let operator x = `Op x
+  let scalar x = `Scalar x
 
   let turnstile x =
     if x = ":-" then `Op (ST.sturnstile)  else `Op x
@@ -369,6 +387,7 @@ module Parse = struct
       Eof
     | UnexpectedInput
     | UnterminatedComment
+    | MalformedScalar
     | MalformedTerm
     | MalformedPredicate
     | UnbalancedParentheses
@@ -382,6 +401,7 @@ module Parse = struct
     | Eof                     -> fmt "unexpected end of stream"
     | UnexpectedInput         -> fmt "unexpected character"
     | UnterminatedComment     -> fmt "unterminated comment"
+    | MalformedScalar         -> fmt "malformed scalar"
     | MalformedTerm           -> fmt "malformed term"
     | MalformedPredicate      -> fmt "malformed predicate"
     | UnbalancedParentheses   -> fmt "unbalanced parentheses"
@@ -422,6 +442,17 @@ module Parse = struct
         | 'A'..'Z' | 'a'..'z'
         | '0'..'9' | '_' | '-'  -> loop_alphanum mk (next buff) s
       | _   -> cont buff @@ mk (lexeme buff s)
+      in next_token buff (efail mk s) cont
+    and loop_num mk buff s =
+      let cont buff = function
+        | '.'  -> loop_decimals mk (next buff) s
+        | '0'..'9' | '_'  -> loop_num mk (next buff) s
+        | _   -> cont buff @@ mk (lexeme buff s)
+      in next_token buff (efail mk s) cont
+    and loop_decimals mk buff s =
+      let cont buff = function
+        | '0'..'9' | '_'  -> loop_decimals mk (next buff) s
+        | _   -> cont buff @@ mk (lexeme buff s)
       in next_token buff (efail mk s) cont
     and begin_quoted mk buff s =
       let cont buff = function
@@ -482,6 +513,8 @@ module Parse = struct
         | 'A'..'Z' -> loop_alphanum var (next buff) s
         (* atoms *)
         | 'a'..'z' -> loop_alphanum atom (next buff) s
+        (* scalars *)
+        | '0'..'9' -> loop_num scalar (next buff) s
         | _        -> fail buff UnexpectedInput in
       next_token buff fail cont in
     skip buff (pos buff)
@@ -535,6 +568,10 @@ module Parse = struct
       end
       | `Var x    -> token (cont (var x)) fail buff
       | `LPar     -> token (term false (op false (close_parens (op fnctr cont fail) fail) fail) fail) fail buff
+      | `Scalar x -> begin
+        try token (cont (Int (int_of_string x))) fail buff
+        with Failure _ -> fail buff MalformedScalar
+      end
       | _         -> fail buff MalformedTerm
     and op fnctr cont fail s buff tk =
       dbg "op : %b %a %a@\n" fnctr Ast.PP.term s pp_token tk;
@@ -686,6 +723,7 @@ module Subst = struct
       let open Ast in
       match t with
       | Atom _       -> t
+      | Int  _       -> t
       | Var v        -> begin try find v s with Not_found -> t end
       | Pred p       -> Pred (pred_apply s p)
       | Clause (p,a) -> Clause (clause_apply s (p,a))
@@ -712,6 +750,7 @@ module Subst = struct
       let open Ast in
       match t with
       | Atom _       -> None
+      | Int _        -> None
       | Var v        -> begin try Some (find v s) with Not_found -> None end
       | Pred p       -> opt_fg (pred_apply_opt s) (fun p -> Some (Pred p)) p
       | Clause c     -> opt_fg (clause_apply_opt s) (fun c -> Some (Clause c)) c
@@ -742,7 +781,6 @@ module Subst = struct
 
     let term_apply s1 = opt_f @@ term_apply_opt s1
     let pred_apply s1 = opt_f @@ pred_apply_opt s1
-    let clause_apply s1 = opt_f @@ clause_apply_opt s1
     let subst_apply s1 = opt_f @@ subst_apply_opt s1
 
   end
@@ -773,10 +811,6 @@ module Subst = struct
       (* are all remaining terms ground ?*)
       match is_empty gs' with
       | true  -> s' (* yes => we're done *)
-      (* we apply substitution [gs'] to [s'], replacing variables
-       * of [s'] by ground terms where applicable.
-       * no, still some which could be simplified further?
-       *)
       | false ->
          match subst_apply_opt gs' s with
          | None    -> s'
@@ -795,6 +829,7 @@ module Unification = struct
     dbg "unify [%a] [%a]@\n" Ast.PP.term left Ast.PP.term right;
     match left, right with
       Atom a1, Atom a2 when a1 == a2 -> Some s
+    | Int i1, Int i2   when i1 = i2  -> Some s
     | Var v1, Var v2   when v1 = v2  -> None
     | Var v1, Var v2                 -> unify_vars s v1 v2 left right
     | Var v, p
@@ -916,6 +951,7 @@ module Eval = struct
 
   let rec instantiate s = function
     | Atom _ as a  -> a
+    | Int _  as a  -> a
     | Var v  as a  -> begin
       try Subst.find v s
       with Not_found -> a
@@ -958,6 +994,7 @@ module Eval = struct
     (* builtin predicates *)
     dbg "Eval.term [%a]@\n" Ast.PP.term p;
     match p with
+    | Int _
     | Var _  -> raise Uninstantiated
     | Atom a -> let k = (a,0) in begin
       try (Builtin.find k) emit fail s ctx []
@@ -1131,6 +1168,43 @@ module Builtins = struct
        loop (mkbuff fname chan (function _ -> ()))
     | _          -> raise Uninstantiated
 
+
+  module Arithmetic = struct
+
+      open StringStore
+      (* simple evaluation algorithm *)
+
+      let [plus_;star_;minus_;div_] = Arith.ops
+
+      let op a b = function
+        | o when o = plus_   -> a + b
+        | o when o = minus_  -> a - b
+        | o when o = star_   -> a * b
+        | o when o = div_    -> a / b
+        | _ -> assert false
+
+      let rec compute p =
+        match p with
+          Int i -> Int i
+        | Pred { name; args = [l;r] } -> begin
+          match compute l, compute r with
+            Int i, Int j -> Int (op i j name)
+          | _ -> assert false
+        end
+        | _ -> raise Uninstantiated
+
+      let eval :  (int -> int -> bool) -> _ -> _ -> Subst.t -> ctx -> term -> term -> _ =
+        fun op emit fail s ctx l r ->
+        match compute l, compute r with
+          Int i, Int j -> if op i j then emit s ctx else fail s ctx
+        | _ -> assert false
+
+      let preds =
+        List.map (fun op emit fail s ctx l r -> eval op emit fail s ctx l r)
+          [(>);(<);(=);(>=);(<=)]
+
+  end
+
 end (* Builtins *)
 
 module Init = struct
@@ -1153,6 +1227,10 @@ module Init = struct
     (ST.equal,2),  (two_args unify);
   ]
 
+  let builtin_pred_defs =
+    let ops = List.map (fun x -> two_args x) Builtins.Arithmetic.preds in
+    Ast.(List.map2 (fun x y -> (x,2), y) StringStore.Arith.preds ops)
+
   (* fix-me: should be in a prelude file *)
   let builtin_ops  =
     let open Ast in [
@@ -1163,15 +1241,28 @@ module Init = struct
     ((ST.equal,2),     (Xfx, 700)); (* unification operator *)
   ]
 
+  let builtin_arith_ops = Ast.(Arithmetic.[
+    (plus_,2),  (Yfx,500);
+    (star_,2),  (Yfx,400);
+    (minus_,2), (Yfx,500);
+    (div_,2),   (Yfx,400);
+  ])
+
+  let builtin_preds = Ast.(List.map (fun x -> (x,2), (Xfx,700)) StringStore.Arith.preds)
+(*
+    ("=="); ("=\\="); ("is");
+      (* ("@<"); ("@=<"); ("@>"); ("@>="); ("\="); ("\=="); ("as") *)
+*)
   let init ctx =
     let iter_def (k,v) =
       dbg "Init def:%a@\n" Reg.PP.key k;
       Eval.Builtin.add k v in
     List.iter iter_def builtin_defs;
+    List.iter iter_def builtin_pred_defs;
     let iter_op (o,(k,l)) =
       dbg "Init op:%a@\n" Reg.PP.key o;
       Reg.Op.add ctx.Eval.Context.reg o k l in
-    List.iter iter_op builtin_ops
+    List.iter iter_op (builtin_ops @ builtin_arith_ops @ builtin_preds)
 
 end
 
