@@ -43,7 +43,7 @@ end
 let dbg = Debug.printf
 
 type atom = int
-type var  = string
+type var  = int * string
 
 module StringStore = struct
 
@@ -87,7 +87,6 @@ module Ast = struct
 
   type term   = Atom of atom | Var of var | Pred of pred | Clause of clause
   and  op     = Xfx | Xfy | Yfx | Fx | Fy | Xf | Yf
-
   and  pred   = { name : atom; infix : bool; args : arg list }
   and  arg    = term
   and  clause = pred * arg
@@ -104,6 +103,16 @@ module Ast = struct
     | ":-", [Atom a;b] -> Clause ({name = a; infix=false; args=[]}, b)
     | _                -> Pred { name = ST.atom name;infix;args }
 
+  let rec term_bound v = function
+    | Var x    -> x = v
+    | Atom _   -> false
+    | Pred p   -> pred_bound v p
+    | Clause c -> clause_bound v c
+  and pred_bound v { args; _ } =
+    List.exists (term_bound v) args
+  and clause_bound v (p,a) =
+    pred_bound v p || term_bound v a
+
   module VarMap = Map.Make(struct type t = var let compare = compare end)
 
   module PP = struct
@@ -117,7 +126,7 @@ module Ast = struct
       | Some x -> fprintf ppf "Some %a" ppv x
 
     let atom ppf x = string ppf (ST.string x)
-    let var ppf x = string ppf x
+    let var ppf (i,x) = if i = -1 then string ppf x else fprintf ppf "%s_%d" x i
 
     let list sep = list ~pp_sep:(fun ppf () -> atom ppf sep)
 
@@ -132,6 +141,11 @@ module Ast = struct
       | Pred p -> pred ppf p
       | Clause (p,s) -> fprintf ppf "%a :- %a" pred p term s
 
+    let varmap pp_e ppf vs =
+      let open Fmt in
+      let l = VarMap.bindings vs in
+      let pp_pair ppf (v,t) = fprintf ppf "@[%a = %a@]" var v pp_e t in
+      fprintf ppf "%a" (list ~pp_sep:(cut ",") pp_pair) l
   end
 
   let rec term_vars l = function
@@ -141,9 +155,7 @@ module Ast = struct
     | Clause (p,t) -> clause_vars l (p,t)
   and clause_vars l (p,t) =
     term_vars (pred_vars l p) t
-  and pred_vars l p =
-    List.fold_left term_vars l p.args
-
+  and pred_vars l p = List.fold_left term_vars l p.args
 
   let ground vars x = vars VarMap.empty x = VarMap.empty
 
@@ -155,8 +167,7 @@ end (* Ast *)
 
 (* the database encoding of values is slightly different from the AST's.
  * Entries must be indexed by their corresponding atom and arity, and
- * they might either point to clauses or facts, the later being a clause
- * without a sequent (or with a tautological one). *)
+ * they might either point to clauses or predicates. *)
 module Reg = struct
 
   exception UndefinedValue
@@ -169,7 +180,7 @@ module Reg = struct
 
   type entry = clause list ref
 
-  let mkkey = function
+  let rec mkkey = function
     | Clause ({ name;args },_)
     | Pred { name;args } -> Some (name, List.length args)
     | Atom s             -> Some (s, 0)
@@ -181,7 +192,7 @@ module Reg = struct
   let mkvalue = function
     | Pred p       -> p,None
     | Clause (p,s) -> p,Some s
-    | Atom name    -> Ast.{ name;infix=false;args=[] }, None
+    | Atom name    -> Ast.{ name; infix=false; args = [] }, None
     | _            -> assert false
 
   type t = {
@@ -241,15 +252,6 @@ module Reg = struct
   let find r k =
     try Some (find r k) with Not_found -> None
 
-  (* there are several kinds of operators:
-   * f x
-   * f y    (left associative)
-   * x f
-   * y f    (right associative)
-   * x f x  (non associative)
-   * x f y  (reduce on the right)
-   * y f x  (reduce on the left)
-   **)
   module Op = struct
 
     let infix r o =
@@ -371,6 +373,7 @@ module Parse = struct
     | MalformedPredicate
     | UnbalancedParentheses
     | UnexpectedToken of token
+    | UndefinedOperator of token
     | OperatorAssocMismatch
     | Other of exn
 
@@ -383,6 +386,7 @@ module Parse = struct
     | MalformedPredicate      -> fmt "malformed predicate"
     | UnbalancedParentheses   -> fmt "unbalanced parentheses"
     | UnexpectedToken token   -> fmt "unexpected token '%a'" pp_token token
+    | UndefinedOperator token -> fmt "unknownn operator '%a'" pp_token token
     | OperatorAssocMismatch   -> fmt "operator associativity mismatch"
     | Other (Sys_error s)     -> fmt "system error : %s" s
     | Other e                 -> raise e
@@ -510,6 +514,9 @@ module Parse = struct
     | Some _, None -> failwith "reduce operator 2"
     | _ -> failwith "reduce operator 1"
 
+
+  let var x = Var (-1,x)
+
   (* fix-me: undefined operator could be a simple atom?*)
   (* note: within functors, comma's meaning changes *)
 
@@ -520,18 +527,19 @@ module Parse = struct
       dbg "@[term %a@\n" pp_token tk;
       match tk with
       (* handle prefix ops *)
+      | `Atom u
       | `Op u     -> begin
         match infix (u,1) with
         | Some ((Fx| Fy), _) -> token (term fnctr (op1_rhs fnctr u cont fail) fail) fail buff
-        | tk                 -> fail buff MalformedTerm
+        | tk                 -> token (begin_functor cont fail u) fail buff
       end
-      | `Var x    -> token (cont (Var x)) fail buff
+      | `Var x    -> token (cont (var x)) fail buff
       | `LPar     -> token (term false (op false (close_parens (op fnctr cont fail) fail) fail) fail) fail buff
-      | `Atom x   -> token (begin_functor cont fail x) fail buff
       | _         -> fail buff MalformedTerm
     and op fnctr cont fail s buff tk =
       dbg "op : %b %a %a@\n" fnctr Ast.PP.term s pp_token tk;
       match tk with
+      | `Atom sym
       | `Op sym    -> begin
         match sym, fnctr, infix (sym,2) with
         | ",", true, _  -> (* functor comma *)
@@ -542,7 +550,8 @@ module Parse = struct
            match infix (sym,1) with
            | Some ((Xf|Yf), _) -> token (term fnctr (op1_reduce fnctr sym cont fail) fail) fail buff
            | Some ((Fx|Fy), _) -> fail buff MalformedTerm
-           | _                 -> cont s buff tk
+           | _                 -> fail buff (UndefinedOperator tk)
+      (* cont s buff tk *)
       end
       | _          -> cont s buff tk
     and op2_reduce fnctr sym cont fail s1 s2 buff tk =
@@ -560,7 +569,7 @@ module Parse = struct
       dbg "op2_rhs : %s %a %a %a@\n" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
       match tk, fnctr with
       | `Op ",", true  -> cont (pop2 s1 s2) buff tk
-      | `Op sym2, _    ->
+      | (`Atom sym2 | `Op sym2), _    ->
          begin
            let scont1 () =
              token (op2_rhs fnctr sym cont fail s1 (pred sym2 [s2])) fail buff
@@ -593,8 +602,8 @@ module Parse = struct
       in
       dbg "op1_rhs : %s %a %a@\n" sym Ast.PP.term s1 pp_token tk;
       match tk with
-      | `Op ","  when fnctr -> cont (pop1 s1) buff tk
-      | `Op sym2            ->
+      | `Op ","  when fnctr     -> cont (pop1 s1) buff tk
+      | (`Atom sym2 | `Op sym2) ->
          begin
            let scont1 () =
              token (cont (pred sym [pred sym2 [s1]])) fail buff
@@ -627,6 +636,7 @@ module Parse = struct
       match tk with
       | `RPar   -> token (cont (pred name (List.rev @@ a::args))) fail buff
       | `Op "," -> token (term true (end_functor cont fail name (a::args)) fail) fail buff
+      | `Atom _
       | `Op _   -> op true (end_functor cont fail name args) fail a buff tk
       | _       -> fail buff MalformedPredicate
     and close_parens cont fail s buff tk =
@@ -652,10 +662,7 @@ module Subst = struct
     Ast.VarMap.is_empty m
 
   let pp ppf (m : t) =
-    let open Ast in let open Fmt in
-    let l = VarMap.bindings m in
-    let pp_pair ppf (v,t) = fprintf ppf "%a = %a" PP.var v PP.term t in
-    fprintf ppf "%a" (list ~pp_sep:(cut ",") pp_pair) l
+    Ast.PP.(varmap term) ppf m
 
   let add v p s =
     Ast.VarMap.add v p s
@@ -663,11 +670,13 @@ module Subst = struct
   let find v s =
     Ast.VarMap.find v s
 
-  let intersect vs s =
+  (* here [vs] is a 'a VarMap.t
+   * we only mean to use it as set of var to filter [s] *)
+  let intersect vs (s : t) : t =
     let intersect k l r =
       match l, r with
-        Some _, Some v -> Some v
-      | _ -> None
+        Some _, Some _ -> r
+      | _              -> None
     in
     Ast.VarMap.merge intersect vs s
 
@@ -695,6 +704,9 @@ module Subst = struct
 
     let opt_f f x = match f x with None -> x | Some x -> x
 
+    (* this function assumes that the substitution set [s]
+     * is "disjoint", ie there are no dependencies betweeen
+     *  substitutions in the set *)
     let rec term_apply_opt s t =
       let opt_fg f g x = match f x with None -> None | Some x -> g x in
       let open Ast in
@@ -705,11 +717,11 @@ module Subst = struct
       | Clause c     -> opt_fg (clause_apply_opt s) (fun c -> Some (Clause c)) c
     and pred_apply_opt s p =
       let fld a (l,b) = match term_apply_opt s a with
-          None -> (a::l,b)
+          None   -> (a::l,b)
         | Some t -> (t::l,true) in
       match List.fold_right fld p.Ast.args ([],false) with
-      | _, false   -> None
-      | args, true -> Some Ast.{ p with args }
+      |    _, false -> None
+      | args, true  -> Some Ast.{ p with args }
     and clause_apply_opt s (p,a : Ast.clause) =
       match pred_apply_opt s p, term_apply_opt s a with
       | None, None     -> None
@@ -720,8 +732,7 @@ module Subst = struct
     let subst_apply_opt s1 s2 =
     (* Map.map will always return a value physically
      * different from its input, thus we'll keep track
-     * manually of whether [s2] remains unmodified
-     * (note: Batteries might be a better fit here) *)
+     * manually of whether [s2] is equal to the result. *)
       let modified = ref false in
       let mapf =
         fun t -> match term_apply_opt s1 t with
@@ -742,31 +753,35 @@ module Subst = struct
     let open Ast in
     VarMap.filter (fun k -> function Var v when v = k -> false | _ -> true) s
 
-  (* tries to compute the transitive closure of s,
-   * ie, replaces variables in terms by the ground term
-   * they associate with, if any *)
+  (* we have a set of equations, we want to drop those that may be inlined,
+   * ie. we want to try to eliminate variables which:
+   * - are not defined in the original clause
+   * - do not induce a recursion (ie, they are not present in both side of
+   *   an equation).
+   *)
+
+  let intermediate (i,v) = i != -1
+
   let simplify s =
     let open Ast.VarMap in
-    let merge_either k a b =
-      match a, b with
-        None, _ -> b
-      | _, None -> a
-      | _       -> assert false in
-    let merge_include k a b =
-      match a, b with
-        None, _ -> b
-      | _,    _ -> a in
-    let rec loop gs s =
-      (* find entries which are ground *)
-      let gs', s' = partition (fun _ t -> Ast.term_ground t) s in
-      dbg "simplify : %a -> @[gs = %a@; s = %a@]@."
+    let rec loop s =
+      (* find entries which are not cyclic *)
+      let partf v t = not (Ast.term_bound v t) && intermediate v in
+      let gs', s' = partition partf s in
+      dbg "simplify: @[%a -> @[gs = @[{%a}@]@; s = @[{%a}@]@]@]@\n"
         pp s pp gs' pp s';
+      (* are all remaining terms ground ?*)
       match is_empty gs' with
-      | true  -> merge merge_either gs s
-      | false -> match subst_apply_opt gs' s' with
-        | None    -> merge merge_either gs s
-        | Some s' -> loop (merge merge_include gs gs') s' in
-    drop_tauto (loop empty s)
+      | true  -> s' (* yes => we're done *)
+      (* we apply substitution [gs'] to [s'], replacing variables
+       * of [s'] by ground terms where applicable.
+       * no, still some which could be simplified further?
+       *)
+      | false ->
+         match subst_apply_opt gs' s with
+         | None    -> s'
+         | Some s' -> loop s' in
+    drop_tauto (loop s)
 
 end (* Subst *)
 
@@ -777,10 +792,10 @@ module Unification = struct
   open Ast
 
   let rec unify s left right =
-    dbg "unify [%a] [%a]@." Ast.PP.term left Ast.PP.term right;
+    dbg "unify [%a] [%a]@\n" Ast.PP.term left Ast.PP.term right;
     match left, right with
       Atom a1, Atom a2 when a1 == a2 -> Some s
-    | Var v1, Var v2  when v1 = v2   -> None
+    | Var v1, Var v2   when v1 = v2  -> None
     | Var v1, Var v2                 -> unify_vars s v1 v2 left right
     | Var v, p
     | p, Var v                       -> unify_var_term s p v
@@ -799,12 +814,19 @@ module Unification = struct
       with Not_found -> None in
     match find v1 s, find v2 s with
       Some p1, Some p2 -> unify s p1 p2
-    | Some p1, None    -> Some (Subst.add v2 p1 s)
-    | None, Some p2    -> Some (Subst.add v1 p2 s)
-    | None, None       -> Some (Subst.add v2 p1 s)
+    | Some p1, None    -> Some (add_subst v2 p1 s)
+    | None, Some p2    -> Some (add_subst v1 p2 s)
+    | None, None       -> match compare v1 v2 with
+      | 0  -> None
+      | -1 -> Some (Subst.add v1 p2 s)
+      | _  -> Some (Subst.add v2 p1 s)
   and unify_var_term s p v =
     try unify s p (Subst.find v s)
-    with Not_found -> Some (Subst.add v p s)
+    with Not_found -> Some (add_subst v p s)
+  and add_subst v t s =
+    (*    let t = Subst.term_apply s t in *)
+    Subst.add v t s
+
 
 end (* Unification *)
 
@@ -827,8 +849,8 @@ module Eval = struct
     let make () =
       { reg = Reg.make (); sym = 0 }
 
-    let name n ctx =
-      n^"_"^string_of_int ctx.sym, { ctx with sym = succ ctx.sym }
+    let name (i,n) ctx =
+      (ctx.sym,n), { ctx with sym = succ ctx.sym }
 
     let rec rename vars apply ctx t =
       let vm = vars VarMap.empty t in
@@ -840,8 +862,11 @@ module Eval = struct
       !r, apply vm t
 
     let term_rename = rename Ast.term_vars Subst.term_apply
-    and clause_rename = rename Ast.clause_vars Subst.clause_apply
-    and pred_rename  = rename Ast.pred_vars Subst.pred_apply
+    let pred_rename = rename Ast.pred_vars Subst.pred_apply
+    let clause_rename ctx (a,b) =
+      match term_rename ctx (Clause (a,b)) with
+      | ctx, (Clause (a,b)) -> ctx, (a,b)
+      | _ -> assert false
 
     (* renaming of a reg entry *)
     let reg_rename ctx = function
@@ -903,8 +928,7 @@ module Eval = struct
   let as_predicate = function
     | Clause ({ name;args },_)
     | Pred { name;args } -> Some ((name, List.length args), args)
-    | Atom s             -> Some ((s, 0), [])
-    | Var  _             -> None
+    | _                  -> None
 
   type ('a,'b,'c) eval = 'a emit -> 'a fail -> Subst.t -> Context.t -> 'b -> 'c
 
@@ -924,17 +948,17 @@ module Eval = struct
    * this function ought to be tail recursive. Is it? *)
   let rec clause p emit fail s ctx c =
     let ctx, (p',a') = Context.reg_rename ctx c in
-    dbg "Eval.clause [%a] [%a :- %a]@." Ast.PP.term p Ast.PP.pred p' Ast.PP.(opt term) a';
-    dbg "subst : @[%a@]@." Subst.pp s;
+    dbg "Eval.clause [%a] [%a :- %a]@\n" Ast.PP.term p Ast.PP.pred p' Ast.PP.(opt term) a';
+    dbg "subst : @[%a@]@\n" Subst.pp s;
     match Unification.unify s p (Pred p'), a' with
-    | Some bindings, Some body -> term emit fail bindings ctx body
+    | Some bindings, Some body -> term emit fail bindings ctx (instantiate bindings body)
     | Some bindings, None      -> emit bindings ctx
     | None, _                  -> fail s ctx
   and term emit fail s ctx (p : term) =
     (* builtin predicates *)
-    dbg "Eval.term [%a]@." Ast.PP.term p;
+    dbg "Eval.term [%a]@\n" Ast.PP.term p;
     match p with
-    | Var v  -> raise Uninstantiated
+    | Var _  -> raise Uninstantiated
     | Atom a -> let k = (a,0) in begin
       try (Builtin.find k) emit fail s ctx []
       with Not_found ->
@@ -975,16 +999,23 @@ module Eval = struct
    * should 'emit' every working set of variables instantiations
    * or fail if none is found *)
   let top ctx p =
+    (* [r] records whether we had at least one output *)
     let r = ref false in
+    (* [vs] holds the variables of p *)
     let vs = Ast.(term_vars VarMap.empty) p in
     let pp_result ppf s =
       match Subst.is_empty s with
-        true -> Fmt.fprintf ppf "true%!"
+        true -> Fmt.fprintf ppf "true"
       | _    -> Fmt.fprintf ppf "%a " Subst.pp s
     in
     let emit s reg =
       if !r then Fmt.eprintf ";@.";
+      dbg "@[<v 2>computing results:@;";
+      dbg "@[var map: %a@]@\n" Ast.PP.(varmap var) vs;
+      dbg "@[before simplification: %a@]@\n" pp_result s;
       let s = Subst.simplify s in
+      dbg "@[before intersection: %a@]@\n" pp_result s;
+      dbg "@]@.";
       let s = Subst.intersect vs s in
       Fmt.eprintf "%a%!" pp_result s;
       continue !r;
@@ -1006,6 +1037,9 @@ module Builtins = struct
 
   open Builtin
 
+  type term = Ast.term
+  type ctx = Eval.Context.t
+
   let zero_arg f emit fail s ctx = function
     | [] -> f emit fail s ctx ()
     | _  -> assert false
@@ -1016,6 +1050,10 @@ module Builtins = struct
 
   let two_args f emit fail s ctx = function
     | [x1;x2] -> f emit fail s ctx x1 x2
+    | _ -> assert false
+
+  let three_args f emit fail s ctx = function
+    | [x1;x2;x3] -> f emit fail s ctx x1 x2 x3
     | _ -> assert false
 
   let dummy_ = Eval.ign
@@ -1085,7 +1123,8 @@ module Builtins = struct
        and cont buff c =
          let buff = updatebuff buff in
          Fmt.eprintf "%a.@." Ast.PP.term c;
-         assertx Reg.add_back emit fail s ctx c;
+         (* assertx must remain silent *)
+         assertx Reg.add_back dummy_ fail s ctx c;
          loop buff
        and loop buff =
          Parse.term (infix ctx) cont cfail buff in
@@ -1146,11 +1185,10 @@ let clearstate state =
 
 let parse cont state =
   let open Parse in
-  let fail buff =
-    function
+  let fail buff = function
     | Eof -> Builtins.(halt dummy_ dummy_) Subst.empty state.ctx
     | err -> Fmt.eprintf "syntax error (%d): %a@." buff.pos pp_error err;
-      clearstate { state with buff } in
+             clearstate { state with buff } in
   term (Builtins.infix state.ctx) cont fail state.buff
 
 let eval_error ppf = let open Fmt in function
