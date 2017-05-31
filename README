@@ -1,22 +1,24 @@
 This is a small implementation of prolog.
-The License is GPL3.
+The License is GPL2 with Ocaml linking exception (same as the Ocaml source code).
 
 At this point the language has only a few primitives implemented:
 
-true/0, false/0, listing/0, halt/0, ground/1, var/1, asserta/1, assertz/1, consult/1, =/2
-and the mandatory conjunction and disjunction operators.
+true/0, false/0, listing/0, halt/0, ground/1, var/1, asserta/1, assertz/1, consult/1, =/2,
+is/2, arithmetic and comparison operators for integers, and the mandatory conjunction and
+disjunction operators.
 
-It also has begining support for integers, but no 'is/2' operator yet.
 
 I started writing this project after I realized that it might be possible to implement
 prolog without a goal stack (which is the usually the choosen design) using continuation 
-passing style programming. I wrote a several parser using this style in the past, and 
+passing style programming. I wrote several parsers using this style in the past, and
 also an Earley parser (which you'll find on github as well). You may see that the later
-basically follows a similar principle than prolog, but with a breadth first search rather
-than depth first. 
+basically follows a principle similar to prolog, but with breadth first search rather
+than depth first.
 
 So there are two branches provided, "master" which hosts the CPS based implementation, and
-"stack-based", whose name is quite explicit.
+"stack-based", whose name is quite explicit. Actually, it turned out more involved to
+write the stack based version, once I had the CPS one basically working (which feels much
+more natural, and whose code looks quite less convoluted).
 
 There are probably still bugs lingering in the code - if you find any just let me know -
 and it hasn't been written with speed in mind, so don't try comparing it with any other 

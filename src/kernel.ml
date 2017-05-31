@@ -44,6 +44,7 @@ let dbg = Debug.printf
 
 type atom = int
 type var  = int * string
+let is_instance = function (-1,_) -> false | _ -> true
 
 module StringStore = struct
 
@@ -65,23 +66,22 @@ module StringStore = struct
   let string x =
     IntMap.find store.strings x
 
-  let strue = "true"
-  let sfalse = "false"
-  let scomma = ","
-  let ssemicolon = ";"
-  let sturnstile = ":-"
-  let sequal = "="
+  let sbuiltins = [ ","; ";"; ":-"; "true"; "false"; "="; "is"; "op" ]
+  let builtins = List.map atom sbuiltins
+  let [ scomma; ssemicolon; sturnstile; strue; sfalse; sequal; sis; sop ] = sbuiltins
+  let [ comma; semicolon; turnstile; true_; false_; equal; is; op ] = builtins
 
-  let true_ = atom strue
-  let false_ = atom sfalse
-  let comma = atom scomma
-  let semicolon = atom ssemicolon
-  let turnstile = atom sturnstile
-  let equal = atom sequal
+  module OpKinds = struct
+
+    let sops = [ "xfx"; "xfy"; "yfx"; "fx"; "fy"; "xf"; "yf" ]
+    let ops = List.map atom sops
+    let [ xfx; xfy; yfx; fx; fy; xf; yf ] = ops
+
+  end
 
   module Arith = struct
 
-    let sops = ["+"; "*"; "-"; "/"]
+    let sops = [ "+"; "*"; "-"; "/" ]
     let ops =  List.map atom sops
 
     let spreds = [ ">"; "<"; ">="; "=<"; "=:=" ]
@@ -789,7 +789,8 @@ module Subst = struct
 
   let drop_tauto s =
     let open Ast in
-    VarMap.filter (fun k -> function Var v when v = k -> false | _ -> true) s
+    let flt k = function Var v when is_instance v -> false | _ -> true in
+    VarMap.filter flt s
 
   (* we have a set of equations, we want to drop those that may be inlined,
    * ie. we want to try to eliminate variables which:
@@ -917,6 +918,7 @@ module Eval = struct
   exception Uninstantiated
   exception TypeError of string
   exception StaticProcedure of Reg.key
+  exception DomainError of string
 
   type 'a emit = Subst.t -> Context.t -> 'a
   type 'a fail = Subst.t -> Context.t -> 'a
@@ -948,6 +950,11 @@ module Eval = struct
       Table.find builtins r
 
   end
+
+  let op_kind = let open ST.OpKinds in function
+    | x when x == xfx -> Xfx | x when x == xfy -> Xfy | x when x == yfx -> Yfx
+    | x when x == fx -> Fx | x when x == fy -> Fy | x when x == xf -> Xf | x when x == yf -> Yf
+    | _ -> raise (DomainError "operator kind")
 
   let rec instantiate s = function
     | Atom _ as a  -> a
@@ -1171,39 +1178,51 @@ module Builtins = struct
 
   module Arithmetic = struct
 
-      open StringStore
+    open StringStore
       (* simple evaluation algorithm *)
 
-      let [plus_;star_;minus_;div_] = Arith.ops
+    let [plus_;star_;minus_;div_] = Arith.ops
 
-      let op a b = function
-        | o when o = plus_   -> a + b
-        | o when o = minus_  -> a - b
-        | o when o = star_   -> a * b
-        | o when o = div_    -> a / b
-        | _ -> assert false
+    let op a b = function
+      | o when o == plus_   -> a + b
+      | o when o == minus_  -> a - b
+      | o when o == star_   -> a * b
+      | o when o == div_    -> a / b
+      | _ -> assert false
 
-      let rec compute p =
-        match p with
-          Int i -> Int i
-        | Pred { name; args = [l;r] } -> begin
-          match compute l, compute r with
-            Int i, Int j -> Int (op i j name)
-          | _ -> assert false
-        end
-        | _ -> raise Uninstantiated
+    let rec compute p =
+      match p with
+        Int i -> Int i
+      | Pred { name; args = [l;r] } -> begin
+        match compute l, compute r with
+          Int i, Int j -> Int (op i j name)
+        | _ -> raise (TypeError "non computable value")
+      end
+      | _ -> raise (TypeError "non computable value")
 
-      let eval :  (int -> int -> bool) -> _ -> _ -> Subst.t -> ctx -> term -> term -> _ =
-        fun op emit fail s ctx l r ->
+    let eval :  (int -> int -> bool) -> _ -> _ -> Subst.t -> ctx -> term -> term -> _ =
+      fun op emit fail s ctx l r ->
         match compute l, compute r with
           Int i, Int j -> if op i j then emit s ctx else fail s ctx
         | _ -> assert false
 
-      let preds =
-        List.map (fun op emit fail s ctx l r -> eval op emit fail s ctx l r)
-          [(>);(<);(=);(>=);(<=)]
+    let preds =
+      List.map (fun op emit fail s ctx l r -> eval op emit fail s ctx l r)
+        [(>);(<);(=);(>=);(<=)]
 
   end
+
+  let is_ emit fail s ctx l r =
+    match l, Arithmetic.compute r with
+      Int i, Int j when i = j -> true_ emit fail s ctx ()
+    | _                       -> false_ emit fail s ctx ()
+
+  let op_ emit fail s ctx p t n =
+    match instantiate s p, instantiate s t, instantiate s n with
+    | Int p, Atom t, Atom o ->
+       Reg.Op.add ctx.Eval.Context.reg (o,2) (op_kind t) p;
+      true_ emit fail s ctx ()
+    | _ -> raise Uninstantiated
 
 end (* Builtins *)
 
@@ -1225,6 +1244,8 @@ module Init = struct
     (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
     (string "consult",1),   (one_arg @@ consult);
     (ST.equal,2),  (two_args unify);
+    (ST.is, 2),    (two_args is_);
+    (ST.op, 3),    (three_args op_);
   ]
 
   let builtin_pred_defs =
@@ -1239,6 +1260,8 @@ module Init = struct
     ((ST.turnstile,2), (Xfx,1200));
     (*    (ST.turnstile, (Fx, 1200)); (* this is the unary turnstile used with consult/_ *) *)
     ((ST.equal,2),     (Xfx, 700)); (* unification operator *)
+    (ST.is,2),         (Xfx,700);
+
   ]
 
   let builtin_arith_ops = Ast.(Arithmetic.[
@@ -1285,7 +1308,9 @@ let parse cont state =
 let eval_error ppf = let open Fmt in function
   | Eval.UndefinedPredicate k   -> fprintf ppf "undefined predicate %a" Reg.PP.key k
   | Eval.Uninstantiated         -> fprintf ppf "unsufficiently instantiated value"
+  | Eval.TypeError s            -> fprintf ppf "type error: %s" s
   | Eval.StaticProcedure k      -> fprintf ppf "cannot modify static value %a" Reg.PP.key k
+  | Eval.DomainError k          -> fprintf ppf "domain error : %s" k
   | e -> raise e
 
 let rec repl state =
