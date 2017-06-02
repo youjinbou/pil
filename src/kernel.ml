@@ -316,7 +316,8 @@ module Parse = struct
   }
 
   let mkbuff fname chan prompt =
-    { fname; chan; parsing = false; prompt; b = Buffer.create 211; line = 0; col = 0; pos = 0; opened = true }
+    { fname; chan; parsing = false; prompt; b = Buffer.create 211;
+      line = 0; col = 0; pos = 0; opened = true }
 
   let fillbuff buff =
     if buff.pos >= Buffer.length buff.b && buff.opened
@@ -353,6 +354,9 @@ module Parse = struct
 
   let char buff =
     Buffer.nth buff.b buff.pos
+
+  let prev buff =
+    { buff with pos = pred buff.pos; col = pred buff.col }
 
   let next buff =
     { buff with pos = succ buff.pos; col = succ buff.col }
@@ -429,7 +433,8 @@ module Parse = struct
     let efail mk s buff = function
       | Eof -> cont buff @@ mk (lexeme buff s)
       | err -> fail buff err
-    and cfail buff _ = fail buff UnterminatedComment
+    and cfail buff _ =
+      fail buff UnterminatedComment
     in
     let rec loop_op buff s =
       let cont buff = function
@@ -445,9 +450,14 @@ module Parse = struct
       in next_token buff (efail mk s) cont
     and loop_num mk buff s =
       let cont buff = function
-        | '.'  -> loop_decimals mk (next buff) s
+        | '.'  -> loop_dot_decimals mk (next buff) s
         | '0'..'9' | '_'  -> loop_num mk (next buff) s
         | _   -> cont buff @@ mk (lexeme buff s)
+      in next_token buff (efail mk s) cont
+    and loop_dot_decimals mk buff s =
+      let cont buff = function
+        | '0'..'9' | '_'  -> loop_decimals mk (next buff) s
+        | _   -> let b = prev buff in cont b @@ mk (lexeme b s)
       in next_token buff (efail mk s) cont
     and loop_decimals mk buff s =
       let cont buff = function
@@ -525,8 +535,8 @@ module Parse = struct
 
   let compare_assoc a1 a2 =
     match a1, a2 with
-    | (Fx | Xfx | Yfx), (Yf | Yfx) ->  1 (* for equal precedence, x is reduced first *)
-    | (Fy | Xfy), (Xf | Xfx | Xfy) -> -1
+    | (Fx | Xfx | Yfx), (Yf | Yfx) -> -1 (* for equal precedence, x is reduced first *)
+    | (Fy | Xfy), (Xf | Xfx | Xfy) ->  1
     | (Fy | Xfy), (Yf | Yfx)       ->  0
     | (Fx | Xfx | Yfx), (Xfx | Xfy | Xf) -> 0
     | (Xf | Yf), _ ->  1
@@ -592,16 +602,16 @@ module Parse = struct
       end
       | _          -> cont s buff tk
     and op2_reduce fnctr sym cont fail s1 s2 buff tk =
-      op fnctr cont fail (pred ~infix:true sym [s1;s2]) buff tk 
+      op fnctr cont fail (pred ~infix:true sym [s1;s2]) buff tk
     and op1_reduce fnctr sym cont fail s1 buff tk =
-      op fnctr cont fail (pred ~infix:false sym [s1]) buff tk 
+      op fnctr cont fail (pred ~infix:false sym [s1]) buff tk
     and op2_rhs fnctr sym cont fail s1 s2 buff tk =
       let pop2 s1 s2 = pred ~infix:true sym [s1;s2] in
       let reduce o2 rcont scont =
-          match reduce infix (sym,2) o2 with
-            `FAIL   -> fail buff OperatorAssocMismatch
-          | `REDUCE -> rcont ()
-          | `SHIFT  -> scont ()
+        match reduce infix (sym,2) o2 with
+          `FAIL   -> fail buff OperatorAssocMismatch
+        | `REDUCE -> rcont ()
+        | `SHIFT  -> scont ()
       in
       dbg "op2_rhs : %s %a %a %a@\n" sym Ast.PP.term s1 Ast.PP.term s2 pp_token tk;
       match tk, fnctr with
@@ -615,18 +625,18 @@ module Parse = struct
            and rcont () =
              token (term fnctr (op2_rhs fnctr sym2 cont fail (pop2 s1 s2)) fail) fail buff
            in
-          match infix (sym2,2), infix (sym2,1) with
-          | Some _, Some _  -> (* both exists: we should try first binary,
-                                * and if no term follow downgrade to unary *)
-             fail buff OperatorAssocMismatch
-          | Some _, None    -> (* only binary *)
-             reduce (sym2,2) rcont scont2
-          | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
-             reduce (sym2,2) rcont scont1
-          | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
-             fail buff OperatorAssocMismatch
-          | _                      -> (* no such operator *)
-             cont (pop2 s1 s2) buff tk
+           match infix (sym2,2), infix (sym2,1) with
+           | Some _, Some _  -> (* both exists: we should try first binary,
+                                 * and if no term follow downgrade to unary *)
+              fail buff OperatorAssocMismatch
+           | Some _, None    -> (* only binary *)
+              reduce (sym2,2) rcont scont2
+           | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
+              reduce (sym2,2) rcont scont1
+           | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
+              fail buff OperatorAssocMismatch
+           | _                      -> (* no such operator *)
+              cont (pop2 s1 s2) buff tk
         end
       | _ -> cont (pop2 s1 s2) buff tk
     and op1_rhs fnctr (sym : string) cont fail s1 buff tk =
@@ -1161,8 +1171,9 @@ module Builtins = struct
        let chan = open_in fname in
        let rec cfail buff = function
          | Eof            -> true_ emit fail s ctx p
-         | Other _ as err -> Format.eprintf "%a" pp_error err; false_ emit fail s ctx p
-         | err            -> Format.eprintf "in '%s' at pos [%d,%d], %a@." buff.fname buff.line buff.col pp_error err;
+         | Other _ as err -> Format.eprintf "%a@." pp_error err; false_ emit fail s ctx p
+         | err            -> Format.eprintf "in '%s' at pos [%d,%d], %a@."
+                               buff.fname buff.line buff.col pp_error err;
                              false_ emit fail s ctx p
        and cont buff c =
          let buff = updatebuff buff in
@@ -1234,8 +1245,8 @@ module Init = struct
   let string s = ST.atom @@ String.init (String.length s) (fun i -> s.[i])
 
   let builtin_defs = [
-    (ST.true_,0),  (zero_arg true_);
-    (ST.false_,0), (zero_arg false_);
+    (ST.true_,0),           (zero_arg true_);
+    (ST.false_,0),          (zero_arg false_);
     (string "listing", 0),  (zero_arg listing_0);
     (string "halt", 0),     (zero_arg halt);
     (string "ground",1),    (one_arg ground);
@@ -1243,9 +1254,9 @@ module Init = struct
     (string "asserta",1),   (one_arg @@ assertx Reg.add_front);
     (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
     (string "consult",1),   (one_arg @@ consult);
-    (ST.equal,2),  (two_args unify);
-    (ST.is, 2),    (two_args is_);
-    (ST.op, 3),    (three_args op_);
+    (ST.equal,2),           (two_args unify);
+    (ST.is, 2),             (two_args is_);
+    (ST.op, 3),             (three_args op_);
   ]
 
   let builtin_pred_defs =
@@ -1288,69 +1299,3 @@ module Init = struct
     List.iter iter_op (builtin_ops @ builtin_arith_ops @ builtin_preds)
 
 end
-
-type state = {
-  ctx  : Eval.Context.t;
-  buff : Parse.buffer
- }
-
-let clearstate state =
-  { state with buff = Parse.clearbuff state.buff }
-
-let parse cont state =
-  let open Parse in
-  let fail buff = function
-    | Eof -> Builtins.(halt dummy_ dummy_) Subst.empty state.ctx
-    | err -> Fmt.eprintf "syntax error (%d): %a@." buff.pos pp_error err;
-             clearstate { state with buff } in
-  term (Builtins.infix state.ctx) cont fail state.buff
-
-let eval_error ppf = let open Fmt in function
-  | Eval.UndefinedPredicate k   -> fprintf ppf "undefined predicate %a" Reg.PP.key k
-  | Eval.Uninstantiated         -> fprintf ppf "unsufficiently instantiated value"
-  | Eval.TypeError s            -> fprintf ppf "type error: %s" s
-  | Eval.StaticProcedure k      -> fprintf ppf "cannot modify static value %a" Reg.PP.key k
-  | Eval.DomainError k          -> fprintf ppf "domain error : %s" k
-  | e -> raise e
-
-let rec repl state =
-  let cont = fun buff t ->
-    let state = { state with buff = Parse.updatebuff buff } in
-    try Eval.top state.ctx t; state
-    with e ->
-      Fmt.eprintf "evaluation error: %a@." eval_error e;
-      clearstate state
-  in
-  let state = parse cont state in
-  repl state
-
-let top ctx =
-  let prompt = function true -> Fmt.printf "| %!" | _ -> Fmt.printf "?- %!" in
-  let state = { ctx; buff = Parse.mkbuff "interactive" stdin prompt } in
-  repl state
-
-let load_file reg fname =
-  let fname = ST.atom fname in
-  ignore (Builtins.(consult dummy_ dummy_) Subst.empty reg (Ast.Atom fname))
-
-open Arg
-
-let load = ref []
-
-let push_load s = load := s::!load
-
-let usage s = s ^ ": [options] [files]"
-
-let _ =
-  Arg.parse (CmdLine.specs ()) push_load (usage Sys.argv.(0));
-  let ctx = Eval.Context.make () in
-  let () = Init.init ctx in
-  let () =
-    try
-      match !load with
-        [] -> ()
-      | l  -> List.iter (load_file ctx) @@ List.rev l
-    with e -> Fmt.eprintf "load error: %a@." eval_error e
-  in
-  flush stderr;
-  top ctx
