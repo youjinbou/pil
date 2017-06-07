@@ -14,7 +14,8 @@ module PList = struct
     | N       -> N
     | C (a,b) -> C (f a, map f b);;
 
-  let rec map2 : type t. ('a -> 'b -> 'c) -> ('a, t) l -> ('b, t) l -> ('c, t) l = fun f l1 l2 ->
+  let rec map2 : type t. ('a -> 'b -> 'c) -> ('a, t) l -> ('b, t) l -> ('c, t) l =
+    fun f l1 l2 ->
     match l1, l2 with
     | N, N -> N
     | C(a1,b1), C(a2,b2) -> C(f a1 a2, map2 f b1 b2);;
@@ -28,11 +29,11 @@ module PList = struct
   let rec iter :  type t. ('a -> unit) -> ('a, t) l -> unit = fun f -> function
     | N -> ()
     | C (a,b) -> f a; iter f b
-    
+
 end
 
 open PList
-  
+
 module Fmt = struct
   include Format
   let list = pp_print_list
