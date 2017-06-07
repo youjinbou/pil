@@ -1,3 +1,38 @@
+(* the following let us have simple type level lengths for lists, it 
+ * permits several operations, as well as matching lists in let bindings
+ * without warnings (actually, the reason it's being used). *)
+module PList = struct
+
+  type ('a, 'b) l =
+      N : ('a, [ `Nil ]) l
+    | C : 'a * ('a, 'b) l -> ('a, [ `Cons of 'b ]) l;;
+
+  let (@&) a b = C (a,b)
+
+  let rec map  : type t. ('a -> 'b) -> ('a, t) l -> ('b, t) l = fun f l ->
+    match l with
+    | N       -> N
+    | C (a,b) -> C (f a, map f b);;
+
+  let rec map2 : type t. ('a -> 'b -> 'c) -> ('a, t) l -> ('b, t) l -> ('c, t) l = fun f l1 l2 ->
+    match l1, l2 with
+    | N, N -> N
+    | C(a1,b1), C(a2,b2) -> C(f a1 a2, map2 f b1 b2);;
+
+  let rec assoc : type t. 'a -> (('a*'b), t) l -> 'b = fun k l ->
+    match l with
+    | N -> raise Not_found
+    | C ((a,b),c) when a = k -> b
+    | C (a,b) -> assoc k b
+
+  let rec iter :  type t. ('a -> unit) -> ('a, t) l -> unit = fun f -> function
+    | N -> ()
+    | C (a,b) -> f a; iter f b
+    
+end
+
+open PList
+  
 module Fmt = struct
   include Format
   let list = pp_print_list
@@ -48,8 +83,8 @@ let is_instance = function (-1,_) -> false | _ -> true
 
 module OpKind = struct
   type t = Xfx | Xfy | Yfx | Fx | Fy | Xf | Yf
-  let strings = [ Xfx, "xfx"; Xfy, "xfy"; Yfx, "yfx"; Fx, "fx"; Fy, "fy"; Xf, "xf"; Yf, "yf" ]
-  let pp ppf k = Fmt.string ppf @@ List.assoc k strings
+  let strings = (Xfx,"xfx") @& (Xfy,"xfy") @& (Yfx,"yfx") @& (Fx,"fx") @& (Fy,"fy") @& (Xf,"xf") @& (Yf,"yf") @& N
+  let pp ppf k = Fmt.string ppf (PList.assoc k strings)
 end
 
 module StringStore = struct
@@ -72,26 +107,26 @@ module StringStore = struct
   let string x =
     IntMap.find store.strings x
 
-  let sbuiltins = [ ","; ";"; ":-"; "true"; "false"; "="; "is"; "op"; "|"; "[|]"; "[]" ]
-  let builtins = List.map atom sbuiltins
-  let [ scomma; ssemicolon; sturnstile; strue; sfalse;
-        sequal; sis; sop; spipe; scons; snil ] = sbuiltins
-  let [ comma; semicolon; turnstile; true_; false_;
-        equal; is; op; pipe; cons; nil ] = builtins
+  let sbuiltins = "," @& ";" @& ":-" @& "true" @& "false" @& "=" @& "is" @& "op" @& "|" @& "[|]" @& "[]" @& N
+  let builtins = PList.map atom sbuiltins
+  let (C (scomma, C (ssemicolon, C (sturnstile, C (strue, C (sfalse,
+       C (sequal, C (sis, C (sop, C (spipe, C (scons, C (snil, N)))))))))))) = sbuiltins
+  let (C (comma, C (semicolon, C (turnstile, C (true_, C (false_,
+       C (equal, C (is, C (op, C (pipe, C (cons, C (nil, N)))))))))))) = builtins
 
   module OpKinds = struct
-    let sops = List.map snd OpKind.strings
-    let ops = List.map atom sops
-    let [ xfx; xfy; yfx; fx; fy; xf; yf ] = ops
+    let sops = PList.map snd OpKind.strings
+    let ops = PList.map atom sops
+    let (C (xfx, C (xfy, C (yfx, C (fx, C (fy, C (xf, C(yf,N)))))))) = ops
   end
 
   module Arith = struct
 
-    let sops = [ "+"; "*"; "-"; "/" ]
-    let ops =  List.map atom sops
+    let sops = "+" @& "*" @& "-" @& "/" @& N
+    let ops =  PList.map atom sops
 
-    let spreds = [ ">"; "<"; ">="; "=<"; "=:=" ]
-    let preds = List.map atom spreds
+    let spreds = ">" @& "<" @& ">=" @& "=<" @& "=:=" @& N
+    let preds = PList.map atom spreds
 
   end
 
@@ -1245,7 +1280,7 @@ module Builtins = struct
     open StringStore
       (* simple evaluation algorithm *)
 
-    let [plus_;star_;minus_;div_] = Arith.ops
+    let (C (plus_, C (star_, C (minus_, C (div_,N))))) = Arith.ops
 
     let op a b = function
       | o when o == plus_   -> a + b
@@ -1271,8 +1306,8 @@ module Builtins = struct
         | _ -> assert false
 
     let preds =
-      List.map (fun op emit fail s ctx l r -> eval op emit fail s ctx l r)
-        [(>);(<);(=);(>=);(<=)]
+      PList.map (fun op emit fail s ctx l r -> eval op emit fail s ctx l r)
+        ((>) @& (<) @& (=) @& (>=) @& (<=) @& N)
 
   end
 
@@ -1304,59 +1339,60 @@ module Init = struct
   let string s = ST.atom @@ String.init (String.length s) (fun i -> s.[i])
 
   let builtin_defs = [
-    (ST.true_,0),           (zero_arg true_);
-    (ST.false_,0),          (zero_arg false_);
-    (string "listing", 0),  (zero_arg listing_0);
-    (string "halt", 0),     (zero_arg halt);
-    (string "ground",1),    (one_arg ground);
-    (string "var", 1),      (one_arg var);
-    (string "asserta",1),   (one_arg @@ assertx Reg.add_front);
-    (string "assertz",1),   (one_arg @@ assertx Reg.add_back);
-    (string "consult",1),   (one_arg @@ consult);
-    (ST.equal,2),           (two_args unify);
-    (ST.is, 2),             (two_args is_);
-    (ST.op, 3),             (three_args op_);
-    (string "defined_ops",0),     (zero_arg defined_ops);
+    (ST.true_,0),            (zero_arg true_);
+    (ST.false_,0),           (zero_arg false_);
+    (string "listing", 0),   (zero_arg listing_0);
+    (string "halt", 0),      (zero_arg halt);
+    (string "ground",1),     (one_arg ground);
+    (string "var", 1),       (one_arg var);
+    (string "asserta",1),    (one_arg @@ assertx Reg.add_front);
+    (string "assertz",1),    (one_arg @@ assertx Reg.add_back);
+    (string "consult",1),    (one_arg @@ consult);
+    (ST.equal,2),            (two_args unify);
+    (ST.is, 2),              (two_args is_);
+    (ST.op, 3),              (three_args op_);
+    (string "_ops_",0),      (zero_arg defined_ops);
   ]
 
   let builtin_pred_defs =
-    let ops = List.map (fun x -> two_args x) Builtins.Arithmetic.preds in
-    Ast.(List.map2 (fun x y -> (x,2), y) StringStore.Arith.preds ops)
+    let ops = PList.map (fun x -> two_args x) Builtins.Arithmetic.preds in
+    Ast.(PList.map2 (fun x y -> (x,2), y) StringStore.Arith.preds ops)
 
   (* fix-me: should be in a prelude file *)
   let builtin_ops  =
-    let open OpKind in [
-    ((ST.comma,2),     (Xfy,1000));
-    ((ST.semicolon,2), (Xfy,1100));
-    ((ST.pipe,2),      (Xfy,1100));
-    ((ST.turnstile,2), (Xfx,1200));
-    (*    (ST.turnstile, (Fx, 1200)); (* this is the unary turnstile used with consult/_ *) *)
-    ((ST.equal,2),     (Xfx, 700)); (* unification operator *)
-    (ST.is,2),         (Xfx,700);
+    OpKind.(
+      ((ST.comma,2),     (Xfy,1000)) @&
+      ((ST.semicolon,2), (Xfy,1100)) @&
+      ((ST.pipe,2),      (Xfy,1100)) @&
+      ((ST.turnstile,2), (Xfx,1200)) @&
+      (*    (ST.turnstile, (Fx, 1200)) @& (* this is the unary turnstile used with consult/_ *) *)
+      ((ST.equal,2),     (Xfx, 700)) @& (* unification operator *)
+      ((ST.is,2),         (Xfx,700)) @& N
+    )
 
-  ]
+  let builtin_arith_ops = OpKind.(Arithmetic.(
+    ((plus_,2),  (Yfx,500)) @&
+    ((star_,2),  (Yfx,400)) @&
+    ((minus_,2), (Yfx,500)) @&
+    ((div_,2),   (Yfx,400)) @& N
+  ))
 
-  let builtin_arith_ops = OpKind.(Arithmetic.[
-    (plus_,2),  (Yfx,500);
-    (star_,2),  (Yfx,400);
-    (minus_,2), (Yfx,500);
-    (div_,2),   (Yfx,400);
-  ])
+  let builtin_preds = OpKind.(PList.map (fun x -> (x,2), (Xfx,700)) StringStore.Arith.preds)
+ (* ("=="); ("=\\="); *)
+ (* ("@<"); ("@=<"); ("@>"); ("@>="); ("\="); ("\=="); ("as") *)
 
-  let builtin_preds = OpKind.(List.map (fun x -> (x,2), (Xfx,700)) StringStore.Arith.preds)
-(*
-    ("=="); ("=\\="); ("is");
-      (* ("@<"); ("@=<"); ("@>"); ("@>="); ("\="); ("\=="); ("as") *)
-*)
   let init ctx =
     let iter_def (k,v) =
       dbg "Init def:%a@\n" Reg.PP.key k;
       Eval.Builtin.add k v in
     List.iter iter_def builtin_defs;
-    List.iter iter_def builtin_pred_defs;
+    PList.iter iter_def builtin_pred_defs;
     let iter_op (o,(k,l)) =
       dbg "Init op:%a@\n" Reg.PP.key o;
       Reg.Op.add ctx.Eval.Context.reg o k l in
-    List.iter iter_op (builtin_ops @ builtin_arith_ops @ builtin_preds)
+    (* no type level concat *)
+    PList.iter iter_op builtin_ops;
+    PList.iter iter_op builtin_arith_ops;
+    PList.iter iter_op builtin_preds
 
 end
