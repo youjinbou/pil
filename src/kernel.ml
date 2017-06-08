@@ -86,6 +86,9 @@ module OpKind = struct
   type t = Xfx | Xfy | Yfx | Fx | Fy | Xf | Yf
   let strings = (Xfx,"xfx") @& (Xfy,"xfy") @& (Yfx,"yfx") @& (Fx,"fx") @& (Fy,"fy") @& (Xf,"xf") @& (Yf,"yf") @& N
   let pp ppf k = Fmt.string ppf (PList.assoc k strings)
+  let arity = function
+    | Xfx | Xfy | Yfx   -> 2
+    | Fx | Fy | Xf | Yf -> 1
 end
 
 module StringStore = struct
@@ -96,7 +99,7 @@ module StringStore = struct
   module IntMap = HT.Make(I)
 
   type t = { mutable c : int; addresses : int StringMap.t; strings : string IntMap.t }
-  let store = { c = 0; addresses = StringMap.create 211; strings =  IntMap.create 211 }
+  let store = { c = 0; addresses = StringMap.create 211; strings = IntMap.create 211 }
 
   let atom x =
     try StringMap.find store.addresses x
@@ -741,7 +744,7 @@ module Parse = struct
            and scont2 () =
              token (term state (op2_rhs state sym2 (op1_rhs state sym cont fail) fail s1) fail) fail buff
            and rcont () =
-             token (term state (op2_rhs state sym cont fail (pred sym2 [s1])) fail) fail buff
+             token (term state (op2_rhs state sym2 cont fail (pred sym [s1])) fail) fail buff
            in
           match infix (sym2,2), infix (sym2,1) with
           | Some _, Some _  -> (* both exists: we should try first binary,
@@ -1320,7 +1323,8 @@ module Builtins = struct
   let op_ emit fail s ctx p t n =
     match instantiate s p, instantiate s t, instantiate s n with
     | Int p, Atom t, Atom o ->
-       Reg.Op.add ctx.Eval.Context.reg (o,2) (op_kind t) p;
+       let k = op_kind t in
+       Reg.Op.add ctx.Eval.Context.reg (o,OpKind.arity k) k p;
       true_ emit fail s ctx ()
     | _ -> raise Uninstantiated
 
@@ -1352,7 +1356,7 @@ module Init = struct
     (ST.equal,2),            (two_args unify);
     (ST.is, 2),              (two_args is_);
     (ST.op, 3),              (three_args op_);
-    (string "_ops_",0),      (zero_arg defined_ops);
+    (string "ops",0),        (zero_arg defined_ops);
   ]
 
   let builtin_pred_defs =
