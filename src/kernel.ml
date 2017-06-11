@@ -5,14 +5,14 @@ module PList = struct
 
   type ('a, 'b) l =
       N : ('a, [ `Nil ]) l
-    | C : 'a * ('a, 'b) l -> ('a, [ `Cons of 'b ]) l;;
+    | C : 'a * ('a, 'b) l -> ('a, [ `Cons of 'b ]) l
 
   let (@&) a b = C (a,b)
 
   let rec map  : type t. ('a -> 'b) -> ('a, t) l -> ('b, t) l = fun f l ->
     match l with
     | N       -> N
-    | C (a,b) -> C (f a, map f b);;
+    | C (a,b) -> C (f a, map f b)
 
   let rec map2 : type t. ('a -> 'b -> 'c) -> ('a, t) l -> ('b, t) l -> ('c, t) l =
     fun f l1 l2 ->
@@ -26,9 +26,14 @@ module PList = struct
     | C ((a,b),c) when a = k -> b
     | C (a,b) -> assoc k b
 
-  let rec iter :  type t. ('a -> unit) -> ('a, t) l -> unit = fun f -> function
+  let rec iter : type t. ('a -> unit) -> ('a, t) l -> unit = fun f -> function
     | N -> ()
     | C (a,b) -> f a; iter f b
+
+  let rec fold : type t. ('a -> 'b -> 'b) -> ('a, t) l -> 'b -> 'b  = fun f l acc ->
+    match l with
+    | N -> acc
+    | C (a,b) -> fold f b (f a acc)
 
 end
 
@@ -234,16 +239,34 @@ module Reg = struct
 
   open Ast
 
-  type key = atom * int
+  type context = atom
+  let default_context = -1
+
+  module Key = struct
+    type t = { context : atom; name : atom; arity : int }
+    let make context name arity = { context; name; arity }
+    let context k = k.context
+    let name k = k.name
+    let arity k = k.arity
+    let hash = Hashtbl.hash
+    let compare = Pervasives.compare
+  end
+
+  open Key
+  type key = Key.t
 
   type clause = pred * arg option (* optional sequent *)
 
   type entry = clause list ref
 
-  let rec mkkey = function
+  let key_of_predicate context name args = { context; name; arity = List.length args }
+  let key_of_atom context name = { context; name; arity = 0 }
+  let key_of_operator = Key.make
+
+  let rec mkkey ?(context=default_context) : term -> key option = function
     | Clause ({ name;args },_)
-    | Pred { name;args } -> Some (name, List.length args)
-    | Atom s             -> Some (s, 0)
+    | Pred { name;args } -> Some (key_of_predicate context name args)
+    | Atom name          -> Some (key_of_atom context name)
     | Var  _             -> None
     | Int  _             -> None
 
@@ -329,8 +352,8 @@ module Reg = struct
   module PP = struct
     open Fmt
 
-    let key ppf (a,i) =
-      fprintf ppf "%a/%d" Ast.PP.atom a i
+    let key ppf k =
+      fprintf ppf "%a/%d" Ast.PP.atom (Key.name k) (Key.arity k)
 
     let value ppf = function
       | p, None   -> fprintf ppf "%a" Ast.PP.term (Pred p)
@@ -343,6 +366,12 @@ module Reg = struct
       HT.iter (fun k v -> fprintf ppf "%a.@." entry (k,v)) reg.clauses
 
   end
+
+  let display_ops reg =
+    (* print out all the operator definitions *)
+    let iterf ppf {context;name;arity} (kind,prec) =
+      Fmt.fprintf ppf "@['%a'@] @[\t%a\t%d@]@\n" Ast.PP.atom name OpKind.pp kind prec in
+    Fmt.eprintf "operators:@\n@[%a@]@." (fun ppf -> HT.iter (iterf ppf)) reg.operators
 
 end (* Reg *)
 
@@ -609,20 +638,17 @@ module Parse = struct
     | `OTHER -> "OTHER"
 
   (* handling operator precedence and associativity *)
-  let reduce infix op1 op2 =
-    let pp_op ppf (a,b) = Fmt.fprintf ppf "%s/%d" a b in
-    dbg " { reduce %a %a } -> " pp_op op1 pp_op op2;
-    match infix op1, infix op2 with
-    | Some (a1,p1) , Some (a2,p2) ->
-       begin
-       match compare p1 p2, compare_assoc a1 a2 with
-         0, 0 -> dbg "0@\n%!"; `FAIL
-       | 0, k
-       | k, _ -> dbg "%d@\n%!" k; if k < 0 then `REDUCE else `SHIFT
-       end
+  let reduce (a1,p1) (a2,p2) =
+    match compare p1 p2, compare_assoc a1 a2 with
+      0, 0 -> dbg "reduce: 0@\n%!"; `FAIL
+    | 0, k
+    | k, _ -> dbg "reduce: (%d,%d) => %d@\n%!" p1 p2 k; if k < 0 then `REDUCE else `SHIFT
+
+  let reduce_opt op1 op2 =
+    match op1, op2 with
+    | Some o1, Some o2 -> reduce o1 o2
     | Some _, None -> failwith "reduce operator 2"
     | _ -> failwith "reduce operator 1"
-
 
   let var x = Var (-1,x)
 
@@ -655,32 +681,32 @@ module Parse = struct
       | `Atom u
       | `Op u     ->
          begin
-        match infix (u,1) with
+        match infix u 1 with
         | Some ((Fx| Fy), _) -> token (term state (op1_rhs state u cont fail) fail) fail buff
-        | tk                 -> token (begin_functor cont fail u) fail buff
+        | Some _             -> fail buff OperatorAssocMismatch
+        | None               -> token (begin_functor cont fail u) fail buff
       end
       | `Var x    -> token (cont (var x)) fail buff
-      | `LPar     -> token (term `NONE (op `NONE (close_parens cont fail) fail) fail) fail buff
-      | `LBra     -> token (term `CONS (op `CONS (close_bracket cont fail) fail) fail) fail buff
+      | `LPar     -> token (term `NONE (close_parens cont fail) fail) fail buff
+      | `LBra     -> token (term `CONS (close_bracket cont fail) fail) fail buff
       | `Scalar x -> begin
         try token (cont (Int (int_of_string x))) fail buff
         with Failure _ -> fail buff MalformedScalar
       end
       | _         -> fail buff MalformedTerm
     and op state cont fail s buff tk =
-      dbg "op : %s <%a> <%a>@\n" (str_state state) Ast.PP.term s pp_token tk;
       match tk with
       | `Atom sym
       | `Op sym    -> begin
-        match sym, state, infix (sym,2) with
+        match sym, state, infix sym 2 with
         | "|", `CONS, _ -> (* replace operator in list state *)
            token (term state (op2_rhs state ST.scons cont fail s) fail) fail buff
         | ",", `OTHER, _  -> (* functor comma *)
-           token (term state (op2_reduce state sym cont fail s) fail) fail buff
+           cont s buff tk
         | _, _, Some _ -> (* binary operator *) 
            token (term state (op2_rhs state sym cont fail s) fail) fail buff
         | _ -> (* else try unary *)
-           match infix (sym,1) with
+           match infix sym 1 with
            | Some ((Xf|Yf), _) -> token (term state (op1_reduce state sym cont fail) fail) fail buff
            | Some ((Fx|Fy), _) -> fail buff MalformedTerm
            | _                 -> fail buff (UndefinedOperator tk)
@@ -692,8 +718,8 @@ module Parse = struct
       op state cont fail (pred ~infix:false sym [s1]) buff tk
     and op2_rhs state sym cont fail s1 s2 buff tk =
       let pop2 s1 s2 = pred ~infix:true sym [s1;s2] in
-      let reduce o2 rcont scont =
-        match reduce infix (sym,2) o2 with
+      let reduce o2 a2 rcont scont =
+        match reduce_opt (infix sym 2) (infix o2 a2) with
           `FAIL   -> fail buff OperatorAssocMismatch
         | `REDUCE -> rcont ()
         | `SHIFT  -> scont ()
@@ -703,7 +729,7 @@ module Parse = struct
       | `Op ",", `OTHER -> cont (pop2 s1 s2) buff tk
       | `Op "|", `CONS when sym = ST.scomma -> token (term state (op2_rhs state ST.scons (op2_reduce state sym cont fail s1) fail s2) fail) fail buff
       | `Op ",", `CONS when sym = ST.scons  -> fail buff MalformedTerm
-      | (`Atom sym2 | `Op sym2), _    ->
+      | (`Atom sym2 | `Op sym2), _          ->
          begin
            let scont1 () =
              token (op2_rhs state sym cont fail s1 (pred sym2 [s2])) fail buff
@@ -712,31 +738,33 @@ module Parse = struct
            and rcont () =
              token (term state (op2_rhs state sym2 cont fail (pop2 s1 s2)) fail) fail buff
            in
-           match infix (sym2,2), infix (sym2,1) with
-           | Some _, Some _  -> (* both exists: we should try first binary,
-                                 * and if no term follows downgrade to unary *)
-              fail buff OperatorAssocMismatch
-           | Some _, None    -> (* only binary *)
-              reduce (sym2,2) rcont scont2
-           | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
-              reduce (sym2,2) rcont scont1
-           | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
-              fail buff OperatorAssocMismatch
-           | _                      -> (* no such operator *)
-              cont (pop2 s1 s2) buff tk
-        end
+          match infix sym2 2, infix sym2 1 with
+          | Some _, Some _  -> (* both exists: we should try first binary,
+                                * and if no term follows downgrade to unary *)
+             fail buff OperatorAssocMismatch
+          | Some _, None    -> (* only binary *)
+             reduce sym2 2 rcont scont2
+          | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
+             reduce sym2 2 rcont scont1
+          | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
+             fail buff MalformedTerm
+          | _                      -> (* no such operator *)
+             cont (pop2 s1 s2) buff tk
+         end
       | _ -> cont (pop2 s1 s2) buff tk
     and op1_rhs state (sym : string) cont fail s1 buff tk =
       let pop1 s = pred sym [s] in
-      let reduce o2 rcont scont =
-          match reduce infix (sym,1) o2 with
-            `FAIL   -> fail buff OperatorAssocMismatch
-          | `REDUCE -> rcont ()
-          | `SHIFT  -> scont ()
+      let reduce o2 a2 rcont scont =
+        match reduce_opt (infix sym 1) (infix o2 a2) with
+          `FAIL   -> fail buff OperatorAssocMismatch
+        | `REDUCE -> rcont ()
+        | `SHIFT  -> scont ()
       in
       dbg "op1_rhs : %s %a %a@\n" sym Ast.PP.term s1 pp_token tk;
       match tk, state with
-      | `Op ",", `OTHER   -> cont (pop1 s1) buff tk
+      | `Op ",", `OTHER -> cont (pop1 s1) buff tk (* reduce *)
+      | `Op ",", `CONS  -> cont (pop1 s1) buff tk (* reduce *)
+      | `Op "|", `CONS  -> token (term state (op2_rhs state ST.scons (op1_reduce state sym cont fail) fail s1) fail) fail buff
       | (`Atom sym2 | `Op sym2), _ ->
          begin
            let scont1 () =
@@ -744,21 +772,21 @@ module Parse = struct
            and scont2 () =
              token (term state (op2_rhs state sym2 (op1_rhs state sym cont fail) fail s1) fail) fail buff
            and rcont () =
-             token (term state (op2_rhs state sym2 cont fail (pred sym [s1])) fail) fail buff
+             cont (pop1 s1) buff tk
            in
-          match infix (sym2,2), infix (sym2,1) with
+          match infix sym2 2, infix sym2 1 with
           | Some _, Some _  -> (* both exists: we should try first binary,
                                 * and if no term follow downgrade to unary *)
              fail buff OperatorAssocMismatch
           | Some _, None    -> (* only binary *)
-             reduce (sym2,2) rcont scont2
+             reduce sym2 2 rcont scont2
           | None, Some ((Xf|Yf),_) -> (* only unary postfix *)
-             reduce (sym2,2) rcont scont1
+             reduce sym2 2 rcont scont1
           | None, Some ((Fx|Fy),_) -> (* only unary prefix *)
-             fail buff OperatorAssocMismatch
+             fail buff MalformedTerm
           | _                      -> (* no such operator *)
              cont (pop1 s1) buff tk
-        end
+         end
       | _ -> cont (pop1 s1) buff tk
     and begin_functor cont fail x buff tk =
       dbg "begin_functor %a@\n" pp_token tk;
@@ -777,11 +805,15 @@ module Parse = struct
       dbg "expr_parens@\n";
       match tk with
       | `RPar -> token (cont s) fail buff
+      | `Atom _
+      | `Op _ -> op `NONE (close_parens cont fail) fail s buff tk
       | tk    -> fail buff UnbalancedParentheses
     and close_bracket cont fail s buff tk =
       dbg "expr_list@\n";
       match tk with
       | `RBra -> token (cont (list s)) fail buff
+      | `Atom _
+      | `Op _ -> op `CONS (close_bracket cont fail) fail s buff tk
       | tk    -> fail buff UnbalancedParentheses
     in
     let cont t buff = function
@@ -1033,11 +1065,8 @@ module Eval = struct
     module TblConf = struct
 
       type t = Reg.key
-
-      let equal (k1,i1) (k2,i2) = k1 = k2 && i1 = i2
-
-      let hash ((k,i) : t) =
-        i * 211 + k
+      let equal k1 k2 = Reg.Key.compare k1 k2 = 0
+      let hash = Reg.Key.hash
 
     end
 
@@ -1070,9 +1099,14 @@ module Eval = struct
   and instantiate_pred s { name;args;infix } =
     { name; args = List.map (instantiate s) args; infix }
 
-  let as_predicate = function
+  let as_predicate t =
+    match t with
     | Clause ({ name;args },_)
-    | Pred { name;args } -> Some ((name, List.length args), args)
+    | Pred { name;args } -> begin
+      match Reg.mkkey t with
+      | Some k -> Some (k, args)
+      | None   -> None (* assert false *)
+    end
     | _                  -> None
 
   type ('a,'b,'c) eval = 'a emit -> 'a fail -> Subst.t -> Context.t -> 'b -> 'c
@@ -1105,7 +1139,7 @@ module Eval = struct
     match p with
     | Int _
     | Var _  -> raise Uninstantiated
-    | Atom a -> let k = (a,0) in begin
+    | Atom a -> let k = Reg.(key_of_atom default_context a) in begin
       try (Builtin.find k) emit fail s ctx []
       with Not_found ->
         match Reg.find ctx.reg k with
@@ -1246,8 +1280,9 @@ module Builtins = struct
       Some bindings -> emit bindings ctx
     | None          -> fail s ctx
 
-  let infix ctx (o,i) = Reg.Op.infix ctx.Context.reg (ST.atom o,i)
-  let is_infix ctx (o,i) = Reg.Op.is_infix ctx.Context.reg (ST.atom o,i)
+  let infix ctx o i = Reg.(Op.infix ctx.Context.reg (key_of_operator default_context (ST.atom o) i))
+
+  let is_infix ctx o i = Reg.(Op.is_infix ctx.Context.reg (key_of_operator default_context (ST.atom o) i))
 
   (* consult loads a file by turning it into a buffer and
    * calling [assertx] above until error or EOF is reached.
@@ -1324,15 +1359,12 @@ module Builtins = struct
     match instantiate s p, instantiate s t, instantiate s n with
     | Int p, Atom t, Atom o ->
        let k = op_kind t in
-       Reg.Op.add ctx.Eval.Context.reg (o,OpKind.arity k) k p;
+       Reg.(Op.add ctx.Eval.Context.reg (key_of_operator default_context o @@ OpKind.arity k) k p);
       true_ emit fail s ctx ()
     | _ -> raise Uninstantiated
 
   let defined_ops emit fail s ctx () =
-    (* print out all the operator definitions *)
-    let iterf ppf (name,ar) (kind,prec) =
-      Fmt.fprintf ppf "@[%a@] :@[\t%a\t%d@]@\n" Ast.PP.atom name OpKind.pp kind prec in
-    Fmt.eprintf "operators:@\n@[%a@]@." (fun ppf -> HT.iter (iterf ppf)) ctx.Eval.Context.reg.Reg.operators 
+    Reg.display_ops ctx.Context.reg
 
 end (* Builtins *)
 
@@ -1370,9 +1402,9 @@ module Init = struct
       ((ST.semicolon,2), (Xfy,1100)) @&
       ((ST.pipe,2),      (Xfy,1100)) @&
       ((ST.turnstile,2), (Xfx,1200)) @&
-      (*    (ST.turnstile, (Fx, 1200)) @& (* this is the unary turnstile used with consult/_ *) *)
+      (*    ((ST.turnstile,1), (Fx, 1200)) @& (* this is the unary turnstile used with consult/_ *) *)
       ((ST.equal,2),     (Xfx, 700)) @& (* unification operator *)
-      ((ST.is,2),         (Xfx,700)) @& N
+      ((ST.is,2),        (Xfx, 700)) @& N
     )
 
   let builtin_arith_ops = OpKind.(Arithmetic.(
@@ -1387,12 +1419,14 @@ module Init = struct
  (* ("@<"); ("@=<"); ("@>"); ("@>="); ("\="); ("\=="); ("as") *)
 
   let init ctx =
-    let iter_def (k,v) =
+    let iter_def ((a,i),v) =
+      let k = Reg.(Key.make default_context a i) in
       dbg "Init def:%a@\n" Reg.PP.key k;
       Eval.Builtin.add k v in
     List.iter iter_def builtin_defs;
     PList.iter iter_def builtin_pred_defs;
-    let iter_op (o,(k,l)) =
+    let iter_op ((a,i),(k,l)) =
+      let o = Reg.(key_of_operator default_context a i) in
       dbg "Init op:%a@\n" Reg.PP.key o;
       Reg.Op.add ctx.Eval.Context.reg o k l in
     (* no type level concat *)
